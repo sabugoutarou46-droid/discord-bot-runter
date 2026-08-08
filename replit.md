@@ -1,6 +1,6 @@
-# [Project name]
+# Discord Bot Runter
 
-_Replace the heading above with the project's name, and this line with one sentence describing what this app does for users._
+Discord上で商品販売・配布を行う自販機Bot。自販機ごとに商品、配布内容、価格、在庫、設置チャンネルを管理できます。
 
 ## Run & Operate
 
@@ -22,19 +22,27 @@ _Replace the heading above with the project's name, and this line with one sente
 
 ## Where things live
 
-_Populate as you build — short repo map plus pointers to the source-of-truth file for DB schema, API contracts, theme files, etc._
+- `main.py` — Discord Bot本体、管理パネル、購入・配布処理、Railway用HTTPヘルスチェック
+- `database.py` — `vending_data.json` を使った自販機・商品・注文データ管理
+- `README.md` — Railwayへの配置手順、Discord権限、管理方法
+- `railway.json`, `Procfile`, `runtime.txt` — Railway起動設定
 
 ## Architecture decisions
 
-_Populate as you build — non-obvious choices a reader couldn't infer from the code (3-5 bullets)._
+- Botトークンはコードへ保存せず、Railway Variablesの `TOKEN1` から読み込む。
+- 商品は自販機名に紐づけ、有限在庫は配布内容を1行1個、無限在庫は1行のテンプレートとして保存する。
+- 商品変更時は既存パネルを編集せず、新しいパネルを投稿してチャンネルの最下部へ移動する。
+- 永続データは小規模運用向けにJSONファイルへ保存し、RailwayではVolumeの利用を推奨する。
 
 ## Product
 
-_Describe the high-level user-facing capabilities of this app once they exist._
+管理者は `/vending` から自販機、商品、配布内容、価格、在庫タイプ、設置・通知チャンネルを選択式で管理できます。購入者は公開パネルから商品を選び、無料商品はPayPayリンクなし、有料商品はPayPay確認後にDMで配布されます。
 
 ## User preferences
 
-_Populate as you build — explicit user instructions worth remembering across sessions._
+- GitHubへの公開はReplitのGitHub連携ではなく、登録したGitHub Personal Access Tokenを使ってpushする。
+- GitHubリポジトリ名は `discord-bot-runter` を使う。
+- Discord BotトークンのVariable名は `TOKEN1` を使う。
 
 ## Gotchas
 
