@@ -21,6 +21,8 @@ DB_FILE = os.getenv("VENDING_DB_FILE", "vending_data.json")
 DEFAULT_MACHINE_NAME = "自販機"
 DEFAULT_NOTIFICATION_CHANNEL_ID = 0
 DEFAULT_ACHIEVEMENT_CHANNEL_ID = 0
+MAX_CONTENT_LINES = 1200
+MAX_PURCHASE_LIMIT = 999
 JST = ZoneInfo("Asia/Tokyo")
 _lock = threading.RLock()
 
@@ -31,7 +33,7 @@ class OrderError(ValueError):
 
 def _default_data() -> dict[str, Any]:
     return {
-        "schema_version": 5,
+        "schema_version": 6,
         "next_item_id": 1,
         "next_order_id": 1,
         "items": [],
@@ -64,9 +66,9 @@ def _clean_contents(value: Any, *, allow_unlimited_marker: bool = False) -> list
         if len(line) > 1000:
             raise ValueError("配布内容の1行は1000文字以内で入力してください。")
         lines.append(line)
-    if len(lines) > 200:
-        raise ValueError("配布内容は1商品につき200行まで登録できます。")
-    if sum(len(line) for line in lines) > 100_000:
+    if len(lines) > MAX_CONTENT_LINES:
+        raise ValueError(f"配布内容は1商品につき{MAX_CONTENT_LINES}行まで登録できます。")
+    if sum(len(line) for line in lines) > 1_200_000:
         raise ValueError("配布内容の合計が大きすぎます。")
     return lines
 
@@ -143,6 +145,13 @@ def _normalise_data(data: dict[str, Any]) -> tuple[dict[str, Any], bool]:
         if "unlimited" not in item:
             item["unlimited"] = False
             changed = True
+        if (
+            not isinstance(item.get("purchase_limit"), int)
+            or isinstance(item.get("purchase_limit"), bool)
+            or not 1 <= int(item.get("purchase_limit", 1)) <= MAX_PURCHASE_LIMIT
+        ):
+            item["purchase_limit"] = 1
+            changed = True
         if item["unlimited"] and len(item["contents"]) > 1:
             item["contents"] = item["contents"][:1]
             changed = True
@@ -175,8 +184,8 @@ def _normalise_data(data: dict[str, Any]) -> tuple[dict[str, Any], bool]:
     if not isinstance(data.get("next_order_id"), int) or data["next_order_id"] <= max_order_id:
         data["next_order_id"] = max_order_id + 1
         changed = True
-    if data.get("schema_version") != 5:
-        data["schema_version"] = 5
+    if data.get("schema_version") != 6:
+        data["schema_version"] = 6
         changed = True
     return data, changed
 
@@ -291,6 +300,7 @@ def add_item(
     price: int,
     contents: list[str] | str,
     unlimited: bool = False,
+    purchase_limit: int = 1,
 ) -> dict[str, Any]:
     machine_name = str(machine_name).strip()
     name = str(name).strip()
@@ -300,6 +310,12 @@ def add_item(
         raise ValueError("商品名は1〜100文字で入力してください。")
     if not isinstance(price, int) or isinstance(price, bool) or price < 0:
         raise ValueError("価格は0以上の整数で入力してください。")
+    if (
+        not isinstance(purchase_limit, int)
+        or isinstance(purchase_limit, bool)
+        or not 1 <= purchase_limit <= MAX_PURCHASE_LIMIT
+    ):
+        raise ValueError(f"購入上限は1〜{MAX_PURCHASE_LIMIT}個で設定してください。")
     clean_lines = _clean_contents(contents)
     if unlimited and len(clean_lines) > 1:
         clean_lines = clean_lines[:1]
@@ -316,6 +332,7 @@ def add_item(
         "price": price,
         "contents": clean_lines,
         "unlimited": bool(unlimited),
+        "purchase_limit": purchase_limit,
         "legacy_stock_unregistered": 0,
     }
     data["next_item_id"] += 1
@@ -330,6 +347,7 @@ def update_item(
     price: int | None = None,
     contents: list[str] | str | None = None,
     unlimited: bool | None = None,
+    purchase_limit: int | None = None,
 ) -> dict[str, Any] | None:
     if name is not None:
         name = str(name).strip()
@@ -337,6 +355,12 @@ def update_item(
             raise ValueError("商品名は1〜100文字で入力してください。")
     if price is not None and (not isinstance(price, int) or isinstance(price, bool) or price < 0):
         raise ValueError("価格は0以上の整数で入力してください。")
+    if purchase_limit is not None and (
+        not isinstance(purchase_limit, int)
+        or isinstance(purchase_limit, bool)
+        or not 1 <= purchase_limit <= MAX_PURCHASE_LIMIT
+    ):
+        raise ValueError(f"購入上限は1〜{MAX_PURCHASE_LIMIT}個で設定してください。")
     clean_lines = _clean_contents(contents) if contents is not None else None
 
     data = load_data()
@@ -355,6 +379,8 @@ def update_item(
         item["price"] = price
     if unlimited is not None:
         item["unlimited"] = bool(unlimited)
+    if purchase_limit is not None:
+        item["purchase_limit"] = purchase_limit
     if clean_lines is not None:
         item["contents"] = clean_lines
         item["legacy_stock_unregistered"] = 0
@@ -406,6 +432,9 @@ def create_order(buyer_id: int, item_id: int, quantity: int) -> dict[str, Any]:
         raise OrderError("商品が見つかりません。")
     contents = _clean_contents(item.get("contents", []))
     unlimited = bool(item.get("unlimited", False))
+    purchase_limit = int(item.get("purchase_limit", 1))
+    if quantity > purchase_limit:
+        raise OrderError(f"この商品の購入上限は1回につき{purchase_limit}個です。")
     if unlimited:
         if not contents:
             raise OrderError("この商品は現在準備中です。")

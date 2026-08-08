@@ -21,6 +21,7 @@ import database
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("vending-bot")
 JST = ZoneInfo("Asia/Tokyo")
+AUTHORIZED_OWNER_ID = 1406662933458452604
 app = Flask(__name__)
 
 
@@ -44,8 +45,7 @@ def keep_alive() -> None:
 def is_administrator(interaction: discord.Interaction) -> bool:
     return bool(
         interaction.guild
-        and isinstance(interaction.user, discord.Member)
-        and interaction.user.guild_permissions.administrator
+        and interaction.user.id == AUTHORIZED_OWNER_ID
     )
 
 
@@ -82,7 +82,11 @@ def vending_embed(machine_name: str) -> discord.Embed:
     for item in items:
         embed.add_field(
             name=truncate(str(item["name"]), 256),
-            value=f"価格: {item['price']}円 | 在庫: {item['stock_label']}",
+            value=(
+                f"値段: {item['price']}円\n"
+                f"在庫: {item['stock_label']}\n"
+                f"購入上限: {item['purchase_limit']}個"
+            ),
             inline=False,
         )
     return embed
@@ -91,7 +95,7 @@ def vending_embed(machine_name: str) -> discord.Embed:
 def admin_embed() -> discord.Embed:
     return discord.Embed(
         title="自販機Bot 管理者メニュー",
-        description="自販機・商品・配布内容をドロップダウンで選んで管理できます。",
+        description="自販機・商品・配布内容をドロップダウンで選んで管理できます。\n管理操作は指定オーナーのみ利用できます。",
         color=discord.Color.blurple(),
     )
 
@@ -289,7 +293,9 @@ class CreateMachineView(ui.View):
         await private_message(interaction, f"題名「{value}」を選択しました。設置先チャンネルも選択してください。")
 
     async def selected(self, interaction: discord.Interaction) -> None:
-        self.machine_name = self.machine_name or database.DEFAULT_MACHINE_NAME
+        if not self.machine_name:
+            await private_message(interaction, "自販機の題名を先に選択または入力してください。")
+            return
         channel_id = int(self.children[0].values[0])
         message = await publish_machine(self.machine_name, channel_id)
         await private_message(
@@ -306,7 +312,11 @@ class NewMachineNameModal(ui.Modal, title="新しい自販機の題名"):
         self.create_view = view
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
-        self.create_view.machine_name = self.machine_name.value.strip()
+        name = self.machine_name.value.strip()
+        if not name:
+            await private_message(interaction, "自販機の題名は必須です。")
+            return
+        self.create_view.machine_name = name
         await private_message(interaction, f"題名「{self.create_view.machine_name}」を設定しました。設置先を選択してください。")
 
 
@@ -322,12 +332,7 @@ class ProductAddMachineView(ui.View):
 class AddItemModal(ui.Modal, title="商品追加"):
     name = ui.TextInput(label="商品名", max_length=100)
     price = ui.TextInput(label="価格（円・無料は0）", placeholder="450", max_length=10)
-    contents = ui.TextInput(
-        label="配布内容（有限は1行1個、無限は1行のみ）",
-        placeholder="コード1\nコード2\nまたは無限在庫の配布テンプレート1行",
-        style=discord.TextStyle.paragraph,
-        max_length=4000,
-    )
+    purchase_limit = ui.TextInput(label="購入上限（1回の個数）", placeholder="1", max_length=3, default="1")
 
     def __init__(self, machine_name: str) -> None:
         super().__init__()
@@ -335,20 +340,37 @@ class AddItemModal(ui.Modal, title="商品追加"):
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         price_text = self.price.value.strip()
+        limit_text = self.purchase_limit.value.strip()
         if not price_text.isdigit():
             await private_message(interaction, "価格は0以上の整数で入力してください。")
             return
+        if not limit_text.isdigit() or not 1 <= int(limit_text) <= database.MAX_PURCHASE_LIMIT:
+            await private_message(interaction, f"購入上限は1〜{database.MAX_PURCHASE_LIMIT}個で入力してください。")
+            return
         await interaction.response.send_message(
             "在庫タイプを選択してください。",
-            view=StockTypeView(self.machine_name, self.name.value, int(price_text), self.contents.value),
+            view=StockTypeView(self.machine_name, self.name.value, int(price_text), int(limit_text)),
             ephemeral=True,
         )
 
 
 class StockTypeView(ui.View):
-    def __init__(self, machine_name: str, name: str, price: int, contents: str, item_id: int | None = None) -> None:
+    def __init__(
+        self,
+        machine_name: str,
+        name: str,
+        price: int,
+        purchase_limit: int = 1,
+        item_id: int | None = None,
+        existing_contents: list[str] | None = None,
+    ) -> None:
         super().__init__(timeout=180)
-        self.machine_name, self.name, self.price, self.contents, self.item_id = machine_name, name, price, contents, item_id
+        self.machine_name = machine_name
+        self.name = name
+        self.price = price
+        self.purchase_limit = purchase_limit
+        self.item_id = item_id
+        self.existing_contents = existing_contents or []
         select = ui.Select(
             placeholder="在庫タイプを選択",
             options=[
@@ -361,12 +383,93 @@ class StockTypeView(ui.View):
 
     async def selected(self, interaction: discord.Interaction) -> None:
         unlimited = self.children[0].values[0] == "unlimited"
+        await interaction.response.send_modal(
+            ContentInputModal(
+                self.machine_name,
+                self.name,
+                self.price,
+                self.purchase_limit,
+                unlimited,
+                self.item_id,
+                self.existing_contents,
+            )
+        )
+
+
+def content_chunks(contents: list[str], max_chunks: int = 4) -> list[str]:
+    chunks: list[str] = []
+    current: list[str] = []
+    current_length = 0
+    for line in contents:
+        line = str(line)
+        added_length = len(line) + (1 if current else 0)
+        if current and (len(current) >= 300 or current_length + added_length > 3900):
+            chunks.append("\n".join(current))
+            current = []
+            current_length = 0
+        current.append(line)
+        current_length += len(line) + (1 if len(current) > 1 else 0)
+    if current:
+        chunks.append("\n".join(current))
+    return chunks[:max_chunks] or [""]
+
+
+class ContentInputModal(ui.Modal, title="配布内容の登録"):
+    def __init__(
+        self,
+        machine_name: str,
+        name: str,
+        price: int,
+        purchase_limit: int,
+        unlimited: bool,
+        item_id: int | None = None,
+        existing_contents: list[str] | None = None,
+    ) -> None:
+        super().__init__()
+        self.machine_name = machine_name
+        self.name = name
+        self.price = price
+        self.purchase_limit = purchase_limit
+        self.unlimited = unlimited
+        self.item_id = item_id
+        values = content_chunks(existing_contents or [], 1 if unlimited else 4)
+        field_count = 1 if unlimited else 4
+        self.content_inputs: list[ui.TextInput] = []
+        for index in range(field_count):
+            field = ui.TextInput(
+                label=f"配布内容 {index + 1}/{field_count}",
+                placeholder="1行につき1個。空欄の欄は無視されます。",
+                style=discord.TextStyle.paragraph,
+                max_length=4000,
+                required=False,
+            )
+            if index < len(values):
+                field.default = values[index]
+            self.content_inputs.append(field)
+            self.add_item(field)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        contents = "\n".join(field.value for field in self.content_inputs if field.value.strip())
         try:
             if self.item_id is None:
-                item = database.add_item(self.machine_name, self.name, self.price, self.contents, unlimited)
+                item = database.add_item(
+                    self.machine_name,
+                    self.name,
+                    self.price,
+                    contents,
+                    self.unlimited,
+                    self.purchase_limit,
+                )
                 message = f"商品「{item['name']}」を「{self.machine_name}」に追加しました。"
             else:
-                item = database.update_item(self.item_id, self.name, self.price, self.contents, unlimited)
+                item = database.update_item(
+                    self.item_id,
+                    self.name,
+                    self.price,
+                    contents,
+                    self.unlimited,
+                    self.purchase_limit,
+                )
                 message = f"商品「{item['name']}」を更新しました。"
         except ValueError as error:
             await private_message(interaction, str(error))
@@ -394,7 +497,16 @@ def product_list_embed(machine_name: str) -> discord.Embed:
         embed.description = "この自販機には商品がありません。"
     for item in items[:25]:
         contents = "無限在庫（配布テンプレート1種類）" if item["unlimited"] else f"{len(item['contents'])}行の配布内容"
-        embed.add_field(name=f"{item['name']}（ID {item['id']}）", value=f"価格: {item['price']}円 / 在庫: {item['stock_label']}\n{contents}", inline=False)
+        embed.add_field(
+            name=truncate(str(item["name"]), 256),
+            value=(
+                f"値段: {item['price']}円\n"
+                f"在庫: {item['stock_label']}\n"
+                f"購入上限: {item['purchase_limit']}個\n"
+                f"{contents}"
+            ),
+            inline=False,
+        )
     return embed
 
 
@@ -415,8 +527,9 @@ class MachineProductView(ui.View):
             content += "\n\n無限在庫: この1種類の内容を繰り返し配布"
         embed = discord.Embed(title=f"商品詳細 / {item['name']}", color=discord.Color.blurple())
         embed.add_field(name="自販機", value=str(item["machine_name"]), inline=True)
-        embed.add_field(name="価格", value=f"{item['price']}円", inline=True)
-        embed.add_field(name="在庫", value=str(item["stock_label"]), inline=True)
+        embed.add_field(name="値段", value=f"{item['price']}円", inline=False)
+        embed.add_field(name="在庫", value=str(item["stock_label"]), inline=False)
+        embed.add_field(name="購入上限", value=f"{item['purchase_limit']}個", inline=False)
         embed.add_field(name="配布内容", value=truncate(content or "配布内容なし", 4000), inline=False)
         await interaction.response.send_message(embed=embed, view=ProductActionsView(item), ephemeral=True)
 
@@ -461,18 +574,22 @@ class ProductActionsView(ui.View):
 class EditItemModal(ui.Modal, title="商品編集"):
     name = ui.TextInput(label="商品名", max_length=100)
     price = ui.TextInput(label="価格（円・無料は0）", max_length=10)
-    contents = ui.TextInput(label="配布内容（有限は複数行、無限は1行）", style=discord.TextStyle.paragraph, max_length=4000)
+    purchase_limit = ui.TextInput(label="購入上限（1回の個数）", max_length=3)
 
     def __init__(self, item: dict[str, object]) -> None:
         super().__init__()
         self.item = item
         self.name.default = str(item["name"])
         self.price.default = str(item["price"])
-        self.contents.default = "\n".join(str(value) for value in item.get("contents", []))
+        self.purchase_limit.default = str(item.get("purchase_limit", 1))
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         if not self.price.value.strip().isdigit():
             await private_message(interaction, "価格は0以上の整数で入力してください。")
+            return
+        limit_text = self.purchase_limit.value.strip()
+        if not limit_text.isdigit() or not 1 <= int(limit_text) <= database.MAX_PURCHASE_LIMIT:
+            await private_message(interaction, f"購入上限は1〜{database.MAX_PURCHASE_LIMIT}個で入力してください。")
             return
         await interaction.response.send_message(
             "在庫タイプを選択してください。",
@@ -480,8 +597,9 @@ class EditItemModal(ui.Modal, title="商品編集"):
                 str(self.item["machine_name"]),
                 self.name.value,
                 int(self.price.value.strip()),
-                self.contents.value,
+                int(limit_text),
                 int(self.item["id"]),
+                list(self.item.get("contents", [])),
             ),
             ephemeral=True,
         )
@@ -564,6 +682,12 @@ class PurchaseModal(ui.Modal, title="購入手続き"):
         quantity_text = self.quantity.value.strip()
         if not re.fullmatch(r"\d{1,3}", quantity_text) or int(quantity_text) <= 0:
             await private_message(interaction, "購入個数は1〜999の整数で入力してください。")
+            return
+        if int(quantity_text) > int(self.item.get("purchase_limit", 1)):
+            await private_message(
+                interaction,
+                f"この商品の購入上限は1回につき{self.item.get('purchase_limit', 1)}個です。",
+            )
             return
         paypay_link = self.paypay_link.value.strip() if self.paypay_link else ""
         if int(self.item["price"]) > 0 and not valid_http_url(paypay_link):
