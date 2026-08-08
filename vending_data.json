@@ -1,0 +1,14 @@
+{
+  "schema_version": 5,
+  "next_item_id": 1,
+  "next_order_id": 1,
+  "items": [],
+  "orders": [],
+  "config": {
+    "admin_role_id": null,
+    "notification_channel_id": 0,
+    "achievement_channel_id": 0,
+    "daily_purchase_limit": 1,
+    "vending_machines": {}
+  }
+}
