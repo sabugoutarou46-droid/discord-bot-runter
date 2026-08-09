@@ -19,12 +19,14 @@ from zoneinfo import ZoneInfo
 
 DB_FILE = os.getenv("VENDING_DB_FILE", "vending_data.json")
 DEFAULT_MACHINE_NAME = "自販機"
-DEFAULT_NOTIFICATION_CHANNEL_ID = 0
-DEFAULT_ACHIEVEMENT_CHANNEL_ID = 0
+DEFAULT_NOTIFICATION_CHANNEL_ID = 1520682389653819463
+DEFAULT_ACHIEVEMENT_CHANNEL_ID = 1520295467227942932
 MAX_CONTENT_LINES = 1200
 MAX_PURCHASE_LIMIT = 999
+SCHEMA_VERSION = 7
 JST = ZoneInfo("Asia/Tokyo")
 _lock = threading.RLock()
+_UNSET = object()
 
 
 class OrderError(ValueError):
@@ -33,7 +35,7 @@ class OrderError(ValueError):
 
 def _default_data() -> dict[str, Any]:
     return {
-        "schema_version": 6,
+        "schema_version": SCHEMA_VERSION,
         "next_item_id": 1,
         "next_order_id": 1,
         "items": [],
@@ -42,7 +44,7 @@ def _default_data() -> dict[str, Any]:
             "admin_role_id": None,
             "notification_channel_id": DEFAULT_NOTIFICATION_CHANNEL_ID,
             "achievement_channel_id": DEFAULT_ACHIEVEMENT_CHANNEL_ID,
-            "daily_purchase_limit": 1,
+            "daily_purchase_limit": 0,
             "vending_machines": {},
         },
     }
@@ -112,6 +114,17 @@ def _normalise_data(data: dict[str, Any]) -> tuple[dict[str, Any], bool]:
     if not isinstance(config.get("vending_machines"), dict):
         config["vending_machines"] = {}
         changed = True
+    if not config.get("notification_channel_id"):
+        config["notification_channel_id"] = DEFAULT_NOTIFICATION_CHANNEL_ID
+        changed = True
+    if not config.get("achievement_channel_id"):
+        config["achievement_channel_id"] = DEFAULT_ACHIEVEMENT_CHANNEL_ID
+        changed = True
+    if config.get("daily_purchase_limit") == 1:
+        # This was the old hidden default, not a user-configurable product
+        # limit. Product purchase limits are now unlimited unless specified.
+        config["daily_purchase_limit"] = 0
+        changed = True
 
     # Migrate the old single-panel format.
     if config.get("vending_channel_id") and config.get("vending_message_id"):
@@ -145,12 +158,22 @@ def _normalise_data(data: dict[str, Any]) -> tuple[dict[str, Any], bool]:
         if "unlimited" not in item:
             item["unlimited"] = False
             changed = True
-        if (
-            not isinstance(item.get("purchase_limit"), int)
-            or isinstance(item.get("purchase_limit"), bool)
-            or not 1 <= int(item.get("purchase_limit", 1)) <= MAX_PURCHASE_LIMIT
+        purchase_limit = item.get("purchase_limit")
+        if data.get("schema_version", 0) < SCHEMA_VERSION and purchase_limit == 1:
+            # Version 6 supplied 1 as an implicit default. Version 7 makes
+            # the normal product setting unlimited, so migrate that default.
+            item["purchase_limit"] = None
+            purchase_limit = None
+            changed = True
+        if purchase_limit == 0 or purchase_limit == "":
+            item["purchase_limit"] = None
+            changed = True
+        elif purchase_limit is not None and (
+            not isinstance(purchase_limit, int)
+            or isinstance(purchase_limit, bool)
+            or not 1 <= int(purchase_limit) <= MAX_PURCHASE_LIMIT
         ):
-            item["purchase_limit"] = 1
+            item["purchase_limit"] = None
             changed = True
         if item["unlimited"] and len(item["contents"]) > 1:
             item["contents"] = item["contents"][:1]
@@ -184,8 +207,8 @@ def _normalise_data(data: dict[str, Any]) -> tuple[dict[str, Any], bool]:
     if not isinstance(data.get("next_order_id"), int) or data["next_order_id"] <= max_order_id:
         data["next_order_id"] = max_order_id + 1
         changed = True
-    if data.get("schema_version") != 6:
-        data["schema_version"] = 6
+    if data.get("schema_version") != SCHEMA_VERSION:
+        data["schema_version"] = SCHEMA_VERSION
         changed = True
     return data, changed
 
@@ -300,7 +323,7 @@ def add_item(
     price: int,
     contents: list[str] | str,
     unlimited: bool = False,
-    purchase_limit: int = 1,
+    purchase_limit: int | None = None,
 ) -> dict[str, Any]:
     machine_name = str(machine_name).strip()
     name = str(name).strip()
@@ -310,7 +333,7 @@ def add_item(
         raise ValueError("商品名は1〜100文字で入力してください。")
     if not isinstance(price, int) or isinstance(price, bool) or price < 0:
         raise ValueError("価格は0以上の整数で入力してください。")
-    if (
+    if purchase_limit is not None and (
         not isinstance(purchase_limit, int)
         or isinstance(purchase_limit, bool)
         or not 1 <= purchase_limit <= MAX_PURCHASE_LIMIT
@@ -347,7 +370,7 @@ def update_item(
     price: int | None = None,
     contents: list[str] | str | None = None,
     unlimited: bool | None = None,
-    purchase_limit: int | None = None,
+    purchase_limit: int | None | object = _UNSET,
 ) -> dict[str, Any] | None:
     if name is not None:
         name = str(name).strip()
@@ -355,7 +378,7 @@ def update_item(
             raise ValueError("商品名は1〜100文字で入力してください。")
     if price is not None and (not isinstance(price, int) or isinstance(price, bool) or price < 0):
         raise ValueError("価格は0以上の整数で入力してください。")
-    if purchase_limit is not None and (
+    if purchase_limit is not _UNSET and purchase_limit is not None and (
         not isinstance(purchase_limit, int)
         or isinstance(purchase_limit, bool)
         or not 1 <= purchase_limit <= MAX_PURCHASE_LIMIT
@@ -379,7 +402,7 @@ def update_item(
         item["price"] = price
     if unlimited is not None:
         item["unlimited"] = bool(unlimited)
-    if purchase_limit is not None:
+    if purchase_limit is not _UNSET:
         item["purchase_limit"] = purchase_limit
     if clean_lines is not None:
         item["contents"] = clean_lines
@@ -432,8 +455,8 @@ def create_order(buyer_id: int, item_id: int, quantity: int) -> dict[str, Any]:
         raise OrderError("商品が見つかりません。")
     contents = _clean_contents(item.get("contents", []))
     unlimited = bool(item.get("unlimited", False))
-    purchase_limit = int(item.get("purchase_limit", 1))
-    if quantity > purchase_limit:
+    purchase_limit = item.get("purchase_limit")
+    if purchase_limit is not None and quantity > int(purchase_limit):
         raise OrderError(f"この商品の購入上限は1回につき{purchase_limit}個です。")
     if unlimited:
         if not contents:

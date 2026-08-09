@@ -1,0 +1,15 @@
+# Railway deploys the Python Discord bot from the repository root.
+# Keep the Replit web artifacts out of this service's build context.
+package.json
+pnpm-lock.yaml
+pnpm-workspace.yaml
+tsconfig.json
+tsconfig.base.json
+node_modules/
+artifacts/
+lib/
+scripts/
+attached_assets/
+.cache/
+.local/
+.pythonlibs/

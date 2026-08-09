@@ -65,6 +65,17 @@ def valid_http_url(value: str) -> bool:
     return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
 
 
+def parse_purchase_limit(value: str) -> int | None | bool:
+    """Return None for the normal unlimited setting, or False for invalid input."""
+    normalized = value.strip().lower()
+    if normalized in {"", "なし", "無制限", "無"}:
+        return None
+    if not normalized.isdigit():
+        return False
+    limit = int(normalized)
+    return limit if 1 <= limit <= database.MAX_PURCHASE_LIMIT else False
+
+
 def positive_id(value: str) -> int | None:
     return int(value.strip()) if value.strip().isdigit() and int(value.strip()) > 0 else None
 
@@ -80,12 +91,14 @@ def vending_embed(machine_name: str) -> discord.Embed:
         embed.description = "現在、販売中の商品はありません。"
         return embed
     for item in items:
+        purchase_limit = item.get("purchase_limit")
+        purchase_limit_label = "なし" if purchase_limit is None else f"{purchase_limit}個"
         embed.add_field(
             name=truncate(str(item["name"]), 256),
             value=(
                 f"値段: {item['price']}円\n"
                 f"在庫: {item['stock_label']}\n"
-                f"購入上限: {item['purchase_limit']}個"
+                f"購入上限: {purchase_limit_label}"
             ),
             inline=False,
         )
@@ -211,7 +224,22 @@ async def send_achievement_log(order: dict[str, object], buyer: discord.abc.User
 
 
 def channel_options(guild: discord.Guild) -> list[discord.SelectOption]:
-    channels = [channel for channel in guild.text_channels if channel.permissions_for(guild.me).send_messages]
+    bot_member = guild.me
+    channels = [
+        channel
+        for channel in guild.text_channels
+        if bot_member is None or channel.permissions_for(bot_member).send_messages
+    ]
+    configured_ids = {
+        int(database.get_config("notification_channel_id", 0) or 0),
+        int(database.get_config("achievement_channel_id", 0) or 0),
+    }
+    configured_channels = [
+        channel
+        for channel in guild.text_channels
+        if channel.id in configured_ids and channel not in channels
+    ]
+    channels = configured_channels + channels
     options = [
         discord.SelectOption(label=truncate(channel.name, 100), value=str(channel.id), description=f"#{channel.name}")
         for channel in channels[:25]
@@ -220,9 +248,16 @@ def channel_options(guild: discord.Guild) -> list[discord.SelectOption]:
 
 
 class ChannelSelect(ui.Select):
-    def __init__(self, purpose: str, callback_handler: object, guild: discord.Guild) -> None:
+    def __init__(
+        self,
+        purpose: str,
+        callback_handler: object,
+        guild: discord.Guild,
+        *,
+        row: int = 0,
+    ) -> None:
         self.purpose = purpose
-        super().__init__(placeholder=f"{purpose}を選択", options=channel_options(guild), row=0)
+        super().__init__(placeholder=f"{purpose}を選択", options=channel_options(guild), row=row)
         self.callback = callback_handler  # type: ignore[assignment]
 
 
@@ -332,7 +367,7 @@ class ProductAddMachineView(ui.View):
 class AddItemModal(ui.Modal, title="商品追加"):
     name = ui.TextInput(label="商品名", max_length=100)
     price = ui.TextInput(label="価格（円・無料は0）", placeholder="450", max_length=10)
-    purchase_limit = ui.TextInput(label="購入上限（1回の個数）", placeholder="1", max_length=3, default="1")
+    purchase_limit = ui.TextInput(label="購入上限（なしで無制限）", placeholder="なし", max_length=3, default="なし")
 
     def __init__(self, machine_name: str) -> None:
         super().__init__()
@@ -344,12 +379,13 @@ class AddItemModal(ui.Modal, title="商品追加"):
         if not price_text.isdigit():
             await private_message(interaction, "価格は0以上の整数で入力してください。")
             return
-        if not limit_text.isdigit() or not 1 <= int(limit_text) <= database.MAX_PURCHASE_LIMIT:
+        purchase_limit = parse_purchase_limit(limit_text)
+        if purchase_limit is False:
             await private_message(interaction, f"購入上限は1〜{database.MAX_PURCHASE_LIMIT}個で入力してください。")
             return
         await interaction.response.send_message(
             "在庫タイプを選択してください。",
-            view=StockTypeView(self.machine_name, self.name.value, int(price_text), int(limit_text)),
+            view=StockTypeView(self.machine_name, self.name.value, int(price_text), purchase_limit),
             ephemeral=True,
         )
 
@@ -360,7 +396,7 @@ class StockTypeView(ui.View):
         machine_name: str,
         name: str,
         price: int,
-        purchase_limit: int = 1,
+        purchase_limit: int | None = None,
         item_id: int | None = None,
         existing_contents: list[str] | None = None,
     ) -> None:
@@ -420,7 +456,7 @@ class ContentInputModal(ui.Modal, title="配布内容の登録"):
         machine_name: str,
         name: str,
         price: int,
-        purchase_limit: int,
+        purchase_limit: int | None,
         unlimited: bool,
         item_id: int | None = None,
         existing_contents: list[str] | None = None,
@@ -497,12 +533,14 @@ def product_list_embed(machine_name: str) -> discord.Embed:
         embed.description = "この自販機には商品がありません。"
     for item in items[:25]:
         contents = "無限在庫（配布テンプレート1種類）" if item["unlimited"] else f"{len(item['contents'])}行の配布内容"
+        purchase_limit = item.get("purchase_limit")
+        purchase_limit_label = "なし" if purchase_limit is None else f"{purchase_limit}個"
         embed.add_field(
             name=truncate(str(item["name"]), 256),
             value=(
                 f"値段: {item['price']}円\n"
                 f"在庫: {item['stock_label']}\n"
-                f"購入上限: {item['purchase_limit']}個\n"
+                f"購入上限: {purchase_limit_label}\n"
                 f"{contents}"
             ),
             inline=False,
@@ -529,7 +567,12 @@ class MachineProductView(ui.View):
         embed.add_field(name="自販機", value=str(item["machine_name"]), inline=True)
         embed.add_field(name="値段", value=f"{item['price']}円", inline=False)
         embed.add_field(name="在庫", value=str(item["stock_label"]), inline=False)
-        embed.add_field(name="購入上限", value=f"{item['purchase_limit']}個", inline=False)
+        purchase_limit = item.get("purchase_limit")
+        embed.add_field(
+            name="購入上限",
+            value="なし" if purchase_limit is None else f"{purchase_limit}個",
+            inline=False,
+        )
         embed.add_field(name="配布内容", value=truncate(content or "配布内容なし", 4000), inline=False)
         await interaction.response.send_message(embed=embed, view=ProductActionsView(item), ephemeral=True)
 
@@ -574,21 +617,22 @@ class ProductActionsView(ui.View):
 class EditItemModal(ui.Modal, title="商品編集"):
     name = ui.TextInput(label="商品名", max_length=100)
     price = ui.TextInput(label="価格（円・無料は0）", max_length=10)
-    purchase_limit = ui.TextInput(label="購入上限（1回の個数）", max_length=3)
+    purchase_limit = ui.TextInput(label="購入上限（なしで無制限）", max_length=3)
 
     def __init__(self, item: dict[str, object]) -> None:
         super().__init__()
         self.item = item
         self.name.default = str(item["name"])
         self.price.default = str(item["price"])
-        self.purchase_limit.default = str(item.get("purchase_limit", 1))
+        self.purchase_limit.default = str(item.get("purchase_limit") or "なし")
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         if not self.price.value.strip().isdigit():
             await private_message(interaction, "価格は0以上の整数で入力してください。")
             return
         limit_text = self.purchase_limit.value.strip()
-        if not limit_text.isdigit() or not 1 <= int(limit_text) <= database.MAX_PURCHASE_LIMIT:
+        purchase_limit = parse_purchase_limit(limit_text)
+        if purchase_limit is False:
             await private_message(interaction, f"購入上限は1〜{database.MAX_PURCHASE_LIMIT}個で入力してください。")
             return
         await interaction.response.send_message(
@@ -597,7 +641,7 @@ class EditItemModal(ui.Modal, title="商品編集"):
                 str(self.item["machine_name"]),
                 self.name.value,
                 int(self.price.value.strip()),
-                int(limit_text),
+                purchase_limit,
                 int(self.item["id"]),
                 list(self.item.get("contents", [])),
             ),
@@ -683,10 +727,11 @@ class PurchaseModal(ui.Modal, title="購入手続き"):
         if not re.fullmatch(r"\d{1,3}", quantity_text) or int(quantity_text) <= 0:
             await private_message(interaction, "購入個数は1〜999の整数で入力してください。")
             return
-        if int(quantity_text) > int(self.item.get("purchase_limit", 1)):
+        purchase_limit = self.item.get("purchase_limit")
+        if purchase_limit is not None and int(quantity_text) > int(purchase_limit):
             await private_message(
                 interaction,
-                f"この商品の購入上限は1回につき{self.item.get('purchase_limit', 1)}個です。",
+                f"この商品の購入上限は1回につき{purchase_limit}個です。",
             )
             return
         paypay_link = self.paypay_link.value.strip() if self.paypay_link else ""
@@ -795,8 +840,8 @@ class VendingView(ui.View):
 class SettingsView(ui.View):
     def __init__(self, guild: discord.Guild) -> None:
         super().__init__(timeout=180)
-        self.add_item(ChannelSelect("注文通知チャンネル", self.notification, guild))
-        self.add_item(ChannelSelect("実績チャンネル", self.achievement, guild))
+        self.add_item(ChannelSelect("PayPay注文通知チャンネル", self.notification, guild, row=0))
+        self.add_item(ChannelSelect("実績チャンネル", self.achievement, guild, row=1))
 
     async def notification(self, interaction: discord.Interaction) -> None:
         channel_id = int(self.children[0].values[0])

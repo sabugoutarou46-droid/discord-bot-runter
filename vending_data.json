@@ -1,14 +1,14 @@
 {
-  "schema_version": 5,
+  "schema_version": 7,
   "next_item_id": 1,
   "next_order_id": 1,
   "items": [],
   "orders": [],
   "config": {
     "admin_role_id": null,
-    "notification_channel_id": 0,
-    "achievement_channel_id": 0,
-    "daily_purchase_limit": 1,
+    "notification_channel_id": 1520682389653819463,
+    "achievement_channel_id": 1520295467227942932,
+    "daily_purchase_limit": 0,
     "vending_machines": {}
   }
 }
