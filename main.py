@@ -84,24 +84,40 @@ def vending_embed(machine_name: str) -> discord.Embed:
     items = database.get_items(machine_name)
     embed = discord.Embed(
         title=machine_name,
-        description="商品を選んで購入してください。",
         color=discord.Color.orange(),
     )
     if not items:
         embed.description = "現在、販売中の商品はありません。"
         return embed
+
+    product_blocks: list[str] = ["商品を選んで購入してください。"]
     for item in items:
         purchase_limit = item.get("purchase_limit")
         purchase_limit_label = "なし" if purchase_limit is None else f"{purchase_limit}個"
-        embed.add_field(
-            name=truncate(str(item["name"]), 256),
-            value=(
-                f"値段: {item['price']}円\n"
-                f"在庫: {item['stock_label']}\n"
-                f"購入上限: {purchase_limit_label}"
-            ),
-            inline=False,
+        product_blocks.append(
+            "\n".join(
+                [
+                    f"**{truncate(str(item['name']), 100)}**",
+                    f"値段：{item['price']}円",
+                    f"在庫：{item['stock_label']}",
+                    f"購入上限：{purchase_limit_label}",
+                ]
+            )
         )
+
+    # Put each product in the description so Discord renders a predictable,
+    # fully vertical block with a visible gap before the next product.
+    description = "\n\n".join(product_blocks)
+    if len(description) <= 4096:
+        embed.description = description
+        return embed
+
+    # Keep all products available if a large catalog exceeds Discord's
+    # description limit; non-inline fields still render one product per row.
+    embed.description = product_blocks[0]
+    for block in product_blocks[1:]:
+        title, *details = block.splitlines()
+        embed.add_field(name=title.replace("**", ""), value="\n".join(details), inline=False)
     return embed
 
 
