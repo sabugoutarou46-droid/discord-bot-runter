@@ -946,7 +946,7 @@ class AdminPanelView(SafeView):
         if not await self.ensure_admin(interaction) or not interaction.guild:
             return
         await defer_ephemeral(interaction)
-        await interaction.followup.send("題名と設置先を選択してください.", view=CreateMachineView(interaction.guild), ephemeral=True)
+        await interaction.followup.send("題名と設置先を選択してください。", view=CreateMachineView(interaction.guild), ephemeral=True)
 
     async def refresh(self, interaction: discord.Interaction) -> None:
         if not await self.ensure_admin(interaction):
@@ -1006,11 +1006,7 @@ class MoveMachineView(SafeView):
     async def selected(self, interaction: discord.Interaction) -> None:
         name = self.children[0].values[0]
         if self.guild:
-            await interaction.response.send_message(
-                "移動先チャンネルを選択してください。",
-                view=MachineChannelView(name, self.guild),
-                ephemeral=True,
-            )
+            await interaction.response.send_message("移動先チャンネルを選択してください。", view=MachineChannelView(name, self.guild), ephemeral=True)
 
 
 class AdminDeliveryView(SafeView):
