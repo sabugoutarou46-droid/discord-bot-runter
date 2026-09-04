@@ -56,6 +56,39 @@ async def private_message(interaction: discord.Interaction, message: str) -> Non
         await interaction.response.send_message(message, ephemeral=True)
 
 
+async def defer_ephemeral(interaction: discord.Interaction) -> None:
+    """Acknowledge an interaction before doing any slow Discord or disk work."""
+    if not interaction.response.is_done():
+        await interaction.response.defer(ephemeral=True)
+
+
+async def report_interaction_error(
+    interaction: discord.Interaction,
+    error: Exception,
+    source: str,
+) -> None:
+    logger.error("Interaction failed in %s", source, exc_info=error)
+    try:
+        await private_message(interaction, "処理中にエラーが発生しました。もう一度お試しください。")
+    except discord.HTTPException:
+        logger.warning("Could not send interaction error message")
+
+
+class SafeView(ui.View):
+    async def on_error(
+        self,
+        interaction: discord.Interaction,
+        error: Exception,
+        item: ui.Item[object],
+    ) -> None:
+        await report_interaction_error(interaction, error, self.__class__.__name__)
+
+
+class SafeModal(ui.Modal):
+    async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
+        await report_interaction_error(interaction, error, self.__class__.__name__)
+
+
 def truncate(value: str, length: int) -> str:
     return value if len(value) <= length else f"{value[: length - 1]}…"
 
@@ -306,13 +339,14 @@ class ItemSelect(ui.Select):
         self.buyer = buyer
 
 
-class MachineChannelView(ui.View):
+class MachineChannelView(SafeView):
     def __init__(self, machine_name: str, guild: discord.Guild) -> None:
         super().__init__(timeout=180)
         self.machine_name = machine_name
         self.add_item(ChannelSelect("設置先チャンネル", self.selected, guild))
 
     async def selected(self, interaction: discord.Interaction) -> None:
+        await defer_ephemeral(interaction)
         channel_id = int(self.children[0].values[0])
         message = await publish_machine(self.machine_name, channel_id)
         await private_message(
@@ -321,7 +355,7 @@ class MachineChannelView(ui.View):
         )
 
 
-class CreateMachineView(ui.View):
+class CreateMachineView(SafeView):
     def __init__(self, guild: discord.Guild) -> None:
         super().__init__(timeout=180)
         self.guild = guild
@@ -344,6 +378,7 @@ class CreateMachineView(ui.View):
         await private_message(interaction, f"題名「{value}」を選択しました。設置先チャンネルも選択してください。")
 
     async def selected(self, interaction: discord.Interaction) -> None:
+        await defer_ephemeral(interaction)
         if not self.machine_name:
             await private_message(interaction, "自販機の題名を先に選択または入力してください。")
             return
@@ -355,7 +390,7 @@ class CreateMachineView(ui.View):
         )
 
 
-class NewMachineNameModal(ui.Modal, title="新しい自販機の題名"):
+class NewMachineNameModal(SafeModal, title="新しい自販機の題名"):
     machine_name = ui.TextInput(label="題名", max_length=80)
 
     def __init__(self, view: CreateMachineView) -> None:
@@ -371,7 +406,7 @@ class NewMachineNameModal(ui.Modal, title="新しい自販機の題名"):
         await private_message(interaction, f"題名「{self.create_view.machine_name}」を設定しました。設置先を選択してください。")
 
 
-class ProductAddMachineView(ui.View):
+class ProductAddMachineView(SafeView):
     def __init__(self) -> None:
         super().__init__(timeout=180)
         self.add_item(MachineSelect(self.selected, "商品を追加する自販機を選択"))
@@ -380,7 +415,7 @@ class ProductAddMachineView(ui.View):
         await interaction.response.send_modal(AddItemModal(self.children[0].values[0]))
 
 
-class AddItemModal(ui.Modal, title="商品追加"):
+class AddItemModal(SafeModal, title="商品追加"):
     name = ui.TextInput(label="商品名", max_length=100)
     price = ui.TextInput(label="価格（円・無料は0）", placeholder="450", max_length=10)
     purchase_limit = ui.TextInput(label="購入上限（なしで無制限）", placeholder="なし", max_length=3, default="なし")
@@ -406,7 +441,7 @@ class AddItemModal(ui.Modal, title="商品追加"):
         )
 
 
-class StockTypeView(ui.View):
+class StockTypeView(SafeView):
     def __init__(
         self,
         machine_name: str,
@@ -466,7 +501,7 @@ def content_chunks(contents: list[str], max_chunks: int = 4) -> list[str]:
     return chunks[:max_chunks] or [""]
 
 
-class ContentInputModal(ui.Modal, title="配布内容の登録"):
+class ContentInputModal(SafeModal, title="配布内容の登録"):
     def __init__(
         self,
         machine_name: str,
@@ -501,6 +536,7 @@ class ContentInputModal(ui.Modal, title="配布内容の登録"):
             self.add_item(field)
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
+        await defer_ephemeral(interaction)
         contents = "\n".join(field.value for field in self.content_inputs if field.value.strip())
         try:
             if self.item_id is None:
@@ -530,16 +566,17 @@ class ContentInputModal(ui.Modal, title="配布内容の登録"):
         await private_message(interaction, message)
 
 
-class ProductSettingsView(ui.View):
+class ProductSettingsView(SafeView):
     def __init__(self) -> None:
         super().__init__(timeout=300)
         self.add_item(MachineSelect(self.selected, "商品設定を開く自販機を選択"))
 
     async def selected(self, interaction: discord.Interaction) -> None:
+        await defer_ephemeral(interaction)
         machine_name = self.children[0].values[0]
         view = MachineProductView(machine_name)
         embed = product_list_embed(machine_name)
-        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+        await interaction.followup.send(embed=embed, view=view, ephemeral=True)
 
 
 def product_list_embed(machine_name: str) -> discord.Embed:
@@ -564,13 +601,14 @@ def product_list_embed(machine_name: str) -> discord.Embed:
     return embed
 
 
-class MachineProductView(ui.View):
+class MachineProductView(SafeView):
     def __init__(self, machine_name: str) -> None:
         super().__init__(timeout=300)
         self.machine_name = machine_name
         self.add_item(ItemSelect(database.get_items(machine_name), self.selected))
 
     async def selected(self, interaction: discord.Interaction) -> None:
+        await defer_ephemeral(interaction)
         item = database.get_item(int(self.children[0].values[0]))
         if item is None:
             await private_message(interaction, "商品が見つかりません。")
@@ -590,10 +628,10 @@ class MachineProductView(ui.View):
             inline=False,
         )
         embed.add_field(name="配布内容", value=truncate(content or "配布内容なし", 4000), inline=False)
-        await interaction.response.send_message(embed=embed, view=ProductActionsView(item), ephemeral=True)
+        await interaction.followup.send(embed=embed, view=ProductActionsView(item), ephemeral=True)
 
 
-class ProductActionsView(ui.View):
+class ProductActionsView(SafeView):
     def __init__(self, item: dict[str, object]) -> None:
         super().__init__(timeout=300)
         self.item = item
@@ -611,6 +649,7 @@ class ProductActionsView(ui.View):
         await interaction.response.send_modal(EditItemModal(self.item))
 
     async def clear(self, interaction: discord.Interaction) -> None:
+        await defer_ephemeral(interaction)
         if database.clear_item_contents(int(self.item["id"])) is None:
             await private_message(interaction, "商品が見つかりません。")
             return
@@ -618,6 +657,7 @@ class ProductActionsView(ui.View):
         await private_message(interaction, "配布内容を削除し、自販機を自動更新しました。")
 
     async def delete(self, interaction: discord.Interaction) -> None:
+        await defer_ephemeral(interaction)
         try:
             deleted = database.delete_item(int(self.item["id"]))
         except database.OrderError as error:
@@ -630,7 +670,7 @@ class ProductActionsView(ui.View):
         await private_message(interaction, "商品を削除し、自販機を自動更新しました。")
 
 
-class EditItemModal(ui.Modal, title="商品編集"):
+class EditItemModal(SafeModal, title="商品編集"):
     name = ui.TextInput(label="商品名", max_length=100)
     price = ui.TextInput(label="価格（円・無料は0）", max_length=10)
     purchase_limit = ui.TextInput(label="購入上限（なしで無制限）", max_length=3)
@@ -665,38 +705,40 @@ class EditItemModal(ui.Modal, title="商品編集"):
         )
 
 
-class ProductDeleteMachineView(ui.View):
+class ProductDeleteMachineView(SafeView):
     def __init__(self) -> None:
         super().__init__(timeout=180)
         self.add_item(MachineSelect(self.selected, "商品を削除する自販機を選択"))
 
     async def selected(self, interaction: discord.Interaction) -> None:
-        await interaction.response.send_message(
+        await defer_ephemeral(interaction)
+        await interaction.followup.send(
             "削除する商品を選択してください。",
             view=MachineProductDeleteView(self.children[0].values[0]),
             ephemeral=True,
         )
 
 
-class MachineProductDeleteView(ui.View):
+class MachineProductDeleteView(SafeView):
     def __init__(self, machine_name: str) -> None:
         super().__init__(timeout=180)
         self.machine_name = machine_name
         self.add_item(ItemSelect(database.get_items(machine_name), self.selected))
 
     async def selected(self, interaction: discord.Interaction) -> None:
+        await defer_ephemeral(interaction)
         item = database.get_item(int(self.children[0].values[0]))
         if item is None:
             await private_message(interaction, "商品が見つかりません。")
             return
-        await interaction.response.send_message(
+        await interaction.followup.send(
             f"「{item['name']}」を削除しますか？",
             view=ConfirmDeleteView(item),
             ephemeral=True,
         )
 
 
-class ConfirmDeleteView(ui.View):
+class ConfirmDeleteView(SafeView):
     def __init__(self, item: dict[str, object]) -> None:
         super().__init__(timeout=120)
         self.item = item
@@ -708,6 +750,7 @@ class ConfirmDeleteView(ui.View):
         self.add_item(no)
 
     async def confirm(self, interaction: discord.Interaction) -> None:
+        await defer_ephemeral(interaction)
         try:
             deleted = database.delete_item(int(self.item["id"]))
         except database.OrderError as error:
@@ -721,7 +764,7 @@ class ConfirmDeleteView(ui.View):
         await private_message(interaction, "削除をキャンセルしました。")
 
 
-class PurchaseModal(ui.Modal, title="購入手続き"):
+class PurchaseModal(SafeModal, title="購入手続き"):
     quantity = ui.TextInput(label="購入個数", placeholder="1", min_length=1, max_length=3)
 
     def __init__(self, item: dict[str, object]) -> None:
@@ -739,6 +782,7 @@ class PurchaseModal(ui.Modal, title="購入手続き"):
             self.paypay_link = None
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
+        await defer_ephemeral(interaction)
         quantity_text = self.quantity.value.strip()
         if not re.fullmatch(r"\d{1,3}", quantity_text) or int(quantity_text) <= 0:
             await private_message(interaction, "購入個数は1〜999の整数で入力してください。")
@@ -815,21 +859,23 @@ class PurchaseModal(ui.Modal, title="購入手続き"):
         await private_message(interaction, f"注文 {order['id']} を受け付けました。合計 {order['total_price']}円です。")
 
 
-class BuyerItemView(ui.View):
+class BuyerItemView(SafeView):
     def __init__(self, machine_name: str) -> None:
         super().__init__(timeout=180)
         self.machine_name = machine_name
-        self.add_item(ItemSelect(database.get_items(machine_name), self.selected, buyer=True))
+        items = database.get_items(machine_name)
+        self.items = {int(item["id"]): item for item in items}
+        self.add_item(ItemSelect(items, self.selected, buyer=True))
 
     async def selected(self, interaction: discord.Interaction) -> None:
-        item = database.get_item(int(self.children[0].values[0]))
+        item = self.items.get(int(self.children[0].values[0]))
         if item is None or item["machine_name"] != self.machine_name or int(item["stock"]) == 0:
             await private_message(interaction, "現在購入できない商品です。")
             return
         await interaction.response.send_modal(PurchaseModal(item))
 
 
-class VendingView(ui.View):
+class VendingView(SafeView):
     """Only buyer actions are attached to public vending panels."""
 
     def __init__(self, machine_name: str) -> None:
@@ -843,34 +889,38 @@ class VendingView(ui.View):
         self.add_item(stock)
 
     async def buy(self, interaction: discord.Interaction) -> None:
-        await interaction.response.send_message(
+        await defer_ephemeral(interaction)
+        await interaction.followup.send(
             "購入する商品を選択してください。",
             view=BuyerItemView(self.machine_name),
             ephemeral=True,
         )
 
     async def check_stock(self, interaction: discord.Interaction) -> None:
-        await interaction.response.send_message(embed=vending_embed(self.machine_name), ephemeral=True)
+        await defer_ephemeral(interaction)
+        await interaction.followup.send(embed=vending_embed(self.machine_name), ephemeral=True)
 
 
-class SettingsView(ui.View):
+class SettingsView(SafeView):
     def __init__(self, guild: discord.Guild) -> None:
         super().__init__(timeout=180)
         self.add_item(ChannelSelect("PayPay注文通知チャンネル", self.notification, guild, row=0))
         self.add_item(ChannelSelect("実績チャンネル", self.achievement, guild, row=1))
 
     async def notification(self, interaction: discord.Interaction) -> None:
+        await defer_ephemeral(interaction)
         channel_id = int(self.children[0].values[0])
         database.set_config(notification_channel_id=channel_id)
         await private_message(interaction, f"注文通知チャンネルを <#{channel_id}> に設定しました。")
 
     async def achievement(self, interaction: discord.Interaction) -> None:
+        await defer_ephemeral(interaction)
         channel_id = int(self.children[1].values[0])
         database.set_config(achievement_channel_id=channel_id)
         await private_message(interaction, f"実績チャンネルを <#{channel_id}> に設定しました。")
 
 
-class AdminPanelView(ui.View):
+class AdminPanelView(SafeView):
     def __init__(self) -> None:
         super().__init__(timeout=None)
         self.add_button("自販機作成・設置", discord.ButtonStyle.primary, self.create, 0, "vending:admin:create")
@@ -893,48 +943,61 @@ class AdminPanelView(ui.View):
         return False
 
     async def create(self, interaction: discord.Interaction) -> None:
-        if await self.ensure_admin(interaction) and interaction.guild:
-            await interaction.response.send_message("題名と設置先を選択してください。", view=CreateMachineView(interaction.guild), ephemeral=True)
+        if not await self.ensure_admin(interaction) or not interaction.guild:
+            return
+        await defer_ephemeral(interaction)
+        await interaction.followup.send("題名と設置先を選択してください.", view=CreateMachineView(interaction.guild), ephemeral=True)
 
     async def refresh(self, interaction: discord.Interaction) -> None:
         if not await self.ensure_admin(interaction):
             return
-        await interaction.response.send_message("更新する自販機を選択してください。", view=RefreshMachineView(), ephemeral=True)
+        await defer_ephemeral(interaction)
+        await interaction.followup.send("更新する自販機を選択してください。", view=RefreshMachineView(), ephemeral=True)
 
     async def move(self, interaction: discord.Interaction) -> None:
         if not await self.ensure_admin(interaction):
             return
-        await interaction.response.send_message("移動する自販機を選択してください。", view=MoveMachineView(interaction.guild), ephemeral=True)
+        await defer_ephemeral(interaction)
+        await interaction.followup.send("移動する自販機を選択してください。", view=MoveMachineView(interaction.guild), ephemeral=True)
 
     async def add(self, interaction: discord.Interaction) -> None:
-        if await self.ensure_admin(interaction):
-            await interaction.response.send_message("商品を追加する自販機を選択してください。", view=ProductAddMachineView(), ephemeral=True)
+        if not await self.ensure_admin(interaction):
+            return
+        await defer_ephemeral(interaction)
+        await interaction.followup.send("商品を追加する自販機を選択してください。", view=ProductAddMachineView(), ephemeral=True)
 
     async def settings_items(self, interaction: discord.Interaction) -> None:
-        if await self.ensure_admin(interaction):
-            await interaction.response.send_message("商品設定を開く自販機を選択してください。", view=ProductSettingsView(), ephemeral=True)
+        if not await self.ensure_admin(interaction):
+            return
+        await defer_ephemeral(interaction)
+        await interaction.followup.send("商品設定を開く自販機を選択してください。", view=ProductSettingsView(), ephemeral=True)
 
     async def delete(self, interaction: discord.Interaction) -> None:
-        if await self.ensure_admin(interaction):
-            await interaction.response.send_message("商品を削除する自販機を選択してください。", view=ProductDeleteMachineView(), ephemeral=True)
+        if not await self.ensure_admin(interaction):
+            return
+        await defer_ephemeral(interaction)
+        await interaction.followup.send("商品を削除する自販機を選択してください。", view=ProductDeleteMachineView(), ephemeral=True)
 
     async def settings(self, interaction: discord.Interaction) -> None:
-        if await self.ensure_admin(interaction) and interaction.guild:
-            await interaction.response.send_message("チャンネルを選択してください。", view=SettingsView(interaction.guild), ephemeral=True)
+        if not await self.ensure_admin(interaction) or not interaction.guild:
+            return
+        await defer_ephemeral(interaction)
+        await interaction.followup.send("チャンネルを選択してください。", view=SettingsView(interaction.guild), ephemeral=True)
 
 
-class RefreshMachineView(ui.View):
+class RefreshMachineView(SafeView):
     def __init__(self) -> None:
         super().__init__(timeout=180)
         self.add_item(MachineSelect(self.selected, "更新する自販機を選択"))
 
     async def selected(self, interaction: discord.Interaction) -> None:
+        await defer_ephemeral(interaction)
         name = self.children[0].values[0]
         message = await refresh_machine(name)
         await private_message(interaction, "自販機を更新しました。" if message else "自販機を更新できませんでした。")
 
 
-class MoveMachineView(ui.View):
+class MoveMachineView(SafeView):
     def __init__(self, guild: discord.Guild | None) -> None:
         super().__init__(timeout=180)
         self.guild = guild
@@ -943,10 +1006,14 @@ class MoveMachineView(ui.View):
     async def selected(self, interaction: discord.Interaction) -> None:
         name = self.children[0].values[0]
         if self.guild:
-            await interaction.response.send_message("移動先チャンネルを選択してください。", view=MachineChannelView(name, self.guild), ephemeral=True)
+            await interaction.response.send_message(
+                "移動先チャンネルを選択してください。",
+                view=MachineChannelView(name, self.guild),
+                ephemeral=True,
+            )
 
 
-class AdminDeliveryView(ui.View):
+class AdminDeliveryView(SafeView):
     def __init__(self, order_id: str) -> None:
         super().__init__(timeout=None)
         self.order_id = order_id
@@ -958,14 +1025,13 @@ class AdminDeliveryView(ui.View):
         if not is_administrator(interaction):
             await private_message(interaction, "管理者のみ商品を配布できます。")
             return
-        order = database.get_order(self.order_id)
-        if order is None or order["status"] != "pending":
-            await private_message(interaction, "この注文は見つからないか、すでに処理済みです。")
-            return
+        # Open the modal immediately. Order lookup is performed after the
+        # modal is submitted, so a slow JSON read cannot miss Discord's
+        # three-second initial response deadline.
         await interaction.response.send_modal(DeliveryConfirmModal(self.order_id))
 
 
-class DeliveryConfirmModal(ui.Modal, title="商品の配布確認"):
+class DeliveryConfirmModal(SafeModal, title="商品の配布確認"):
     confirmation = ui.TextInput(label="入金確認済みの場合は「確認」と入力", placeholder="確認", max_length=10)
 
     def __init__(self, order_id: str) -> None:
@@ -979,6 +1045,7 @@ class DeliveryConfirmModal(ui.Modal, title="商品の配布確認"):
         if self.confirmation.value.strip() != "確認":
             await private_message(interaction, "「確認」と入力すると配布できます。")
             return
+        await defer_ephemeral(interaction)
         order = database.begin_delivery(self.order_id)
         if order is None:
             await private_message(interaction, "この注文は処理できません。")

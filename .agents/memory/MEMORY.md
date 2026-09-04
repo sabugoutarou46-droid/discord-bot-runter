@@ -1,0 +1,1 @@
+- [Discord interaction timing](discord-interaction-timing.md) — acknowledge interactions before disk or network work, then use follow-ups.
