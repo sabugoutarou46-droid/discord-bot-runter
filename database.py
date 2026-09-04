@@ -11,13 +11,17 @@ from __future__ import annotations
 import copy
 import json
 import os
+import shutil
 import threading
 from datetime import datetime, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
 
-DB_FILE = os.getenv("VENDING_DB_FILE", "vending_data.json")
+LEGACY_DB_FILE = "vending_data.json"
+DEFAULT_DB_FILE = os.path.join("data", "vending_data.json")
+DB_FILE = os.getenv("VENDING_DB_FILE") or DEFAULT_DB_FILE
+BACKUP_FILE = f"{DB_FILE}.bak"
 DEFAULT_MACHINE_NAME = "自販機"
 DEFAULT_NOTIFICATION_CHANNEL_ID = 1520682389653819463
 DEFAULT_ACHIEVEMENT_CHANNEL_ID = 1520295467227942932
@@ -221,20 +225,58 @@ def _write_data(data: dict[str, Any]) -> None:
         json.dump(data, file, indent=2, ensure_ascii=False)
         file.flush()
         os.fsync(file.fileno())
+    if os.path.exists(DB_FILE):
+        try:
+            _read_json_file(DB_FILE)
+        except (json.JSONDecodeError, OSError, ValueError):
+            # Keep an existing good backup when recovering from a damaged file.
+            pass
+        else:
+            shutil.copyfile(DB_FILE, BACKUP_FILE)
     os.replace(temporary_file, DB_FILE)
+
+
+def _read_json_file(path: str) -> dict[str, Any]:
+    with open(path, encoding="utf-8") as file:
+        data = json.load(file)
+    if not isinstance(data, dict):
+        raise ValueError("保存データの形式が正しくありません。")
+    return data
+
+
+def _restore_source() -> tuple[str, dict[str, Any]] | None:
+    """Find a previous data file without silently replacing it with defaults."""
+    candidates = [BACKUP_FILE]
+    if os.path.abspath(LEGACY_DB_FILE) != os.path.abspath(DB_FILE):
+        candidates.append(LEGACY_DB_FILE)
+    for path in candidates:
+        if not os.path.exists(path):
+            continue
+        try:
+            return path, _read_json_file(path)
+        except (json.JSONDecodeError, OSError, ValueError):
+            continue
+    return None
 
 
 def load_data() -> dict[str, Any]:
     with _lock:
         if not os.path.exists(DB_FILE):
-            data = _default_data()
+            restored = _restore_source()
+            data = restored[1] if restored else _default_data()
+            data, changed = _normalise_data(data)
             _write_data(data)
             return copy.deepcopy(data)
         try:
-            with open(DB_FILE, encoding="utf-8") as file:
-                data = json.load(file)
-        except (json.JSONDecodeError, OSError) as error:
-            raise RuntimeError(f"{DB_FILE} を読み込めません。") from error
+            data = _read_json_file(DB_FILE)
+        except (json.JSONDecodeError, OSError, ValueError) as error:
+            restored = _restore_source()
+            if restored is None:
+                raise RuntimeError(f"{DB_FILE} を読み込めません。バックアップも見つかりません。") from error
+            _, data = restored
+            data, _ = _normalise_data(data)
+            _write_data(data)
+            return copy.deepcopy(data)
         data, changed = _normalise_data(data)
         if changed:
             _write_data(data)

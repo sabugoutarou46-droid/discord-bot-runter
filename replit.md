@@ -23,7 +23,7 @@ Discord上で商品販売・配布を行う自販機Bot。自販機ごとに商�
 ## Where things live
 
 - `main.py` — Discord Bot本体、管理パネル、購入・配布処理、Railway用HTTPヘルスチェック
-- `database.py` — `vending_data.json` を使った自販機・商品・注文データ管理
+- `database.py` — `data/vending_data.json`（または `VENDING_DB_FILE`）を使った自販機・商品・注文データ管理
 - `README.md` — Railwayへの配置手順、Discord権限、管理方法
 - `railway.json`, `Procfile`, `runtime.txt` — Railway起動設定
 
@@ -34,7 +34,7 @@ Discord上で商品販売・配布を行う自販機Bot。自販機ごとに商�
 - 配布内容は1商品あたり最大1200行、購入上限は商品ごとの1回あたり個数として保存する。
 - 管理操作と有料注文の配布確認は、指定されたDiscordユーザーIDに限定する。
 - 商品変更時は既存パネルを編集せず、新しいパネルを投稿してチャンネルの最下部へ移動する。
-- 永続データは小規模運用向けにJSONファイルへ保存し、RailwayではVolumeの利用を推奨する。
+- 永続データは小規模運用向けに追跡対象外のJSONファイルへ保存し、旧 `vending_data.json` は初回起動時に自動移行する。Railwayでは `/data` Volumeを利用する。
 
 ## Product
 

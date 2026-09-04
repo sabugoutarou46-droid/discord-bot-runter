@@ -1079,6 +1079,7 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
 
 if __name__ == "__main__":
     token = os.getenv("TOKEN1")
+    logger.info("Vending data file: %s", database.DB_FILE)
     if not token:
         logger.error("TOKEN1 is not set. Add the Discord Bot Token as Railway Variable TOKEN1 to start the bot.")
         # Keep Railway's health check online while the owner finishes setup.

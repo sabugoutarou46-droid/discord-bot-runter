@@ -52,3 +52,6 @@ Thumbs.db
 # Replit
 .cache/
 .local/
+
+# Runtime data must survive code edits without being committed.
+data/

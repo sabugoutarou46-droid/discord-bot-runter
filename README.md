@@ -37,9 +37,13 @@ Bot Tokenはソースコード、`.env`、`vending_data.json`へ保存しない�
 
 ## データ保存について
 
-初期状態では `vending_data.json` に保存します。Railwayの再デプロイやサービス再作成でデータを失わないよう、Railway Volumeを `/data` にマウントし、Variableを次のように設定してください。
+通常の実行では、編集で上書きされない `data/vending_data.json` に保存します。以前の `vending_data.json` が残っている場合は、初回起動時に自動で引き継ぎます。直前の保存内容は `data/vending_data.json.bak` にも保持します。
+
+Railwayの再デプロイやサービス再作成でもデータを失わないよう、Railway Volumeを `/data` にマウントし、Variableを次のように設定してください。
 
 `VENDING_DB_FILE=/data/vending_data.json`
+
+Volumeを設定しない場合、Railwayの新しい実行環境では保存データが引き継がれないことがあります。自販機を作成した後にRailwayでサービスを作り直す場合は、必ずVolumeを同じ `/data` に接続してください。
 
 ## 管理の流れ
 
