@@ -154,25 +154,6 @@ def vending_embed(machine_name: str) -> discord.Embed:
     return embed
 
 
-def sales_embed(machine_name: str) -> discord.Embed:
-    items = database.get_items(machine_name)
-    embed = discord.Embed(
-        title=f"売れた数 / {machine_name}",
-        description="管理者が入金確認して配布完了した累計販売数です。",
-        color=discord.Color.green(),
-    )
-    if not items:
-        embed.description = "現在、販売中の商品はありません。"
-        return embed
-    for item in items[:25]:
-        embed.add_field(
-            name=truncate(str(item["name"]), 256),
-            value=f"売れた数：{item['sold_count']}個",
-            inline=False,
-        )
-    return embed
-
-
 def admin_embed() -> discord.Embed:
     return discord.Embed(
         title="自販機Bot 管理者メニュー",
@@ -460,7 +441,6 @@ class AddItemModal(SafeModal, title="商品追加"):
     name = ui.TextInput(label="商品名", max_length=100)
     price = ui.TextInput(label="価格（円・無料は0）", placeholder="450", max_length=10)
     purchase_limit = ui.TextInput(label="購入上限（なしで無制限）", placeholder="なし", max_length=3, default="なし")
-    sold_count = ui.TextInput(label="今までに売れた数", placeholder="0", max_length=10, default="0")
 
     def __init__(self, machine_name: str) -> None:
         super().__init__()
@@ -469,16 +449,8 @@ class AddItemModal(SafeModal, title="商品追加"):
     async def on_submit(self, interaction: discord.Interaction) -> None:
         price_text = self.price.value.strip()
         limit_text = self.purchase_limit.value.strip()
-        sold_count_text = self.sold_count.value.strip()
         if not price_text.isdigit():
             await private_message(interaction, "価格は0以上の整数で入力してください。")
-            return
-        if not sold_count_text.isdigit():
-            await private_message(interaction, "売れた数は0以上の整数で入力してください。")
-            return
-        sold_count = int(sold_count_text)
-        if sold_count > database.MAX_SOLD_COUNT:
-            await private_message(interaction, f"売れた数は{database.MAX_SOLD_COUNT}個以下で入力してください。")
             return
         purchase_limit = parse_purchase_limit(limit_text)
         if purchase_limit is False:
@@ -491,7 +463,6 @@ class AddItemModal(SafeModal, title="商品追加"):
                 self.name.value,
                 int(price_text),
                 purchase_limit,
-                sold_count=sold_count,
             ),
             ephemeral=True,
         )
@@ -646,21 +617,20 @@ def product_list_embed(machine_name: str) -> discord.Embed:
     items = database.get_items(machine_name)
     embed = discord.Embed(
         title=f"商品設定 / {machine_name}",
-        description="商品を選択すると詳細を確認できます。番号順に売れた数を一括設定できます。",
+        description="商品を選択すると配布内容を確認できます。",
         color=discord.Color.blurple(),
     )
     if not items:
         embed.description = "この自販機には商品がありません。"
-    for index, item in enumerate(items[:25], 1):
+    for item in items[:25]:
         contents = "無限在庫（配布テンプレート1種類）" if item["unlimited"] else f"{len(item['contents'])}行の配布内容"
         purchase_limit = item.get("purchase_limit")
         purchase_limit_label = "なし" if purchase_limit is None else f"{purchase_limit}個"
         embed.add_field(
-            name=truncate(f"{index}. {item['name']}", 256),
+            name=truncate(str(item["name"]), 256),
             value=(
                 f"値段: {item['price']}円\n"
                 f"在庫: {item['stock_label']}\n"
-                f"売れた数: {item['sold_count']}個\n"
                 f"購入上限: {purchase_limit_label}\n"
                 f"{contents}"
             ),
@@ -669,65 +639,11 @@ def product_list_embed(machine_name: str) -> discord.Embed:
     return embed
 
 
-class BulkSoldCountModal(SafeModal, title="売れた数を一括設定"):
-    sold_counts = ui.TextInput(
-        label="商品順に1行1個数",
-        placeholder="商品一覧の番号順に入力\n例:\n0\n3\n12",
-        style=discord.TextStyle.paragraph,
-        max_length=4000,
-    )
-
-    def __init__(self, machine_name: str, items: list[dict[str, object]]) -> None:
-        super().__init__()
-        self.machine_name = machine_name
-        self.items = items
-        self.sold_counts.default = "\n".join(str(item["sold_count"]) for item in items)
-
-    async def on_submit(self, interaction: discord.Interaction) -> None:
-        await defer_ephemeral(interaction)
-        lines = self.sold_counts.value.splitlines()
-        while lines and not lines[-1].strip():
-            lines.pop()
-        if len(lines) != len(self.items):
-            await private_message(
-                interaction,
-                f"商品一覧の順番で、売れた数を{len(self.items)}行入力してください。",
-            )
-            return
-        sold_counts: list[int] = []
-        for index, line in enumerate(lines, 1):
-            value = line.strip()
-            if not value.isdigit():
-                await private_message(interaction, f"{index}行目は0以上の整数で入力してください。")
-                return
-            sold_counts.append(int(value))
-        try:
-            database.bulk_update_sold_counts(self.machine_name, sold_counts)
-        except ValueError as error:
-            await private_message(interaction, str(error))
-            return
-        await refresh_all(self.machine_name)
-        await private_message(
-            interaction,
-            f"「{self.machine_name}」の{len(sold_counts)}商品の売れた数を更新しました。",
-        )
-
-
 class MachineProductView(SafeView):
     def __init__(self, machine_name: str) -> None:
         super().__init__(timeout=300)
         self.machine_name = machine_name
         self.add_item(ItemSelect(database.get_items(machine_name), self.selected))
-        bulk = ui.Button(label="売れた数を一括設定", style=discord.ButtonStyle.secondary, row=1)
-        bulk.callback = self.bulk_sold_counts
-        self.add_item(bulk)
-
-    async def bulk_sold_counts(self, interaction: discord.Interaction) -> None:
-        items = database.get_items(self.machine_name)
-        if not items:
-            await private_message(interaction, "この自販機には商品がありません。")
-            return
-        await interaction.response.send_modal(BulkSoldCountModal(self.machine_name, items))
 
     async def selected(self, interaction: discord.Interaction) -> None:
         await defer_ephemeral(interaction)
@@ -743,7 +659,6 @@ class MachineProductView(SafeView):
         embed.add_field(name="自販機", value=str(item["machine_name"]), inline=True)
         embed.add_field(name="値段", value=f"{item['price']}円", inline=False)
         embed.add_field(name="在庫", value=str(item["stock_label"]), inline=False)
-        embed.add_field(name="売れた数", value=f"{item['sold_count']}個", inline=False)
         purchase_limit = item.get("purchase_limit")
         embed.add_field(
             name="購入上限",
@@ -797,7 +712,6 @@ class EditItemModal(SafeModal, title="商品編集"):
     name = ui.TextInput(label="商品名", max_length=100)
     price = ui.TextInput(label="価格（円・無料は0）", max_length=10)
     purchase_limit = ui.TextInput(label="購入上限（なしで無制限）", max_length=3)
-    sold_count = ui.TextInput(label="今までに売れた数", max_length=10)
 
     def __init__(self, item: dict[str, object]) -> None:
         super().__init__()
@@ -805,19 +719,10 @@ class EditItemModal(SafeModal, title="商品編集"):
         self.name.default = str(item["name"])
         self.price.default = str(item["price"])
         self.purchase_limit.default = str(item.get("purchase_limit") or "なし")
-        self.sold_count.default = str(item.get("sold_count", 0))
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         if not self.price.value.strip().isdigit():
             await private_message(interaction, "価格は0以上の整数で入力してください。")
-            return
-        sold_count_text = self.sold_count.value.strip()
-        if not sold_count_text.isdigit():
-            await private_message(interaction, "売れた数は0以上の整数で入力してください。")
-            return
-        sold_count = int(sold_count_text)
-        if sold_count > database.MAX_SOLD_COUNT:
-            await private_message(interaction, f"売れた数は{database.MAX_SOLD_COUNT}個以下で入力してください。")
             return
         limit_text = self.purchase_limit.value.strip()
         purchase_limit = parse_purchase_limit(limit_text)
@@ -831,9 +736,8 @@ class EditItemModal(SafeModal, title="商品編集"):
                 self.name.value,
                 int(self.price.value.strip()),
                 purchase_limit,
-                sold_count,
-                int(self.item["id"]),
-                list(self.item.get("contents", [])),
+                item_id=int(self.item["id"]),
+                existing_contents=list(self.item.get("contents", [])),
             ),
             ephemeral=True,
         )
@@ -1018,7 +922,7 @@ class VendingView(SafeView):
         self.machine_name = machine_name
         buy = ui.Button(label="購入する", style=discord.ButtonStyle.success, custom_id=f"vending:buy:{machine_name}")
         buy.callback = self.buy
-        stock = ui.Button(label="売れた数確認", style=discord.ButtonStyle.secondary, custom_id=f"vending:stock:{machine_name}")
+        stock = ui.Button(label="在庫確認", style=discord.ButtonStyle.secondary, custom_id=f"vending:stock:{machine_name}")
         stock.callback = self.check_stock
         self.add_item(buy)
         self.add_item(stock)
@@ -1033,7 +937,7 @@ class VendingView(SafeView):
 
     async def check_stock(self, interaction: discord.Interaction) -> None:
         await defer_ephemeral(interaction)
-        await interaction.followup.send(embed=sales_embed(self.machine_name), ephemeral=True)
+        await interaction.followup.send(embed=vending_embed(self.machine_name), ephemeral=True)
 
 
 class SettingsView(SafeView):

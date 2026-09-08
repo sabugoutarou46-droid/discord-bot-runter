@@ -604,27 +604,6 @@ def update_item(
     return _public_item(item)
 
 
-def bulk_update_sold_counts(machine_name: str, sold_counts: list[int]) -> list[dict[str, Any]]:
-    """Update sold counts for every product in a machine in one save."""
-    machine_name = str(machine_name).strip()
-    data = load_data()
-    items = [item for item in data["items"] if item.get("machine_name") == machine_name]
-    if not items:
-        raise ValueError("この自販機には商品がありません。")
-    if len(sold_counts) != len(items):
-        raise ValueError(f"売れた数は商品数と同じ{len(items)}行で入力してください。")
-    for index, sold_count in enumerate(sold_counts, 1):
-        if (
-            not isinstance(sold_count, int)
-            or isinstance(sold_count, bool)
-            or not 0 <= sold_count <= MAX_SOLD_COUNT
-        ):
-            raise ValueError(f"{index}行目の売れた数は0〜{MAX_SOLD_COUNT}個で入力してください。")
-        items[index - 1]["sold_count"] = sold_count
-    _save(data)
-    return [_public_item(item) for item in items]
-
-
 def clear_item_contents(item_id: int) -> dict[str, Any] | None:
     data = load_data()
     item = next((entry for entry in data["items"] if entry["id"] == item_id), None)
