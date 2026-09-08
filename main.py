@@ -193,7 +193,9 @@ class MyBot(commands.Bot):
             logger.info("Added %s starter template products", added_templates)
         database.recover_delivery_orders()
         self.add_view(AdminPanelView())
-        for machine_name in database.get_machine_names():
+        machine_names = database.get_machine_names()
+        logger.info("Registered vending machines: %s", ", ".join(machine_names))
+        for machine_name in machine_names:
             self.add_view(VendingView(machine_name))
         for order in database.get_active_orders():
             self.add_view(AdminDeliveryView(order["id"]))
@@ -340,7 +342,9 @@ class ChannelSelect(ui.Select):
 
 class MachineSelect(ui.Select):
     def __init__(self, callback_handler: object, placeholder: str = "自販機を選択") -> None:
+        database.ensure_default_templates()
         machines = database.get_machine_names()[:25]
+        logger.info("Building machine selector '%s' with %d options: %s", placeholder, len(machines), ", ".join(machines))
         options = [discord.SelectOption(label=truncate(name, 100), value=name) for name in machines]
         options = options or [discord.SelectOption(label="自販機なし", value="none")]
         super().__init__(
