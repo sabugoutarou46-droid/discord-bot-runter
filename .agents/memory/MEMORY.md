@@ -1,1 +1,2 @@
 - [Discord interaction timing](discord-interaction-timing.md) — acknowledge interactions before disk or network work, then use follow-ups.
+- [Confirmation-time inventory](confirmation-time-inventory.md) — distinguish legacy pre-reserved orders from new confirmation-time reservations.
