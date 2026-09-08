@@ -32,6 +32,86 @@ SCHEMA_VERSION = 8
 JST = ZoneInfo("Asia/Tokyo")
 _lock = threading.RLock()
 _UNSET = object()
+WARNING_CONTENT = "⚠️マネーロンダリングの可能せいがあります⚠️"
+
+# These are starter vending machines from the supplied reference panels. They
+# are added only when the machine name does not already exist in saved data.
+# A finite product gets one warning line per unit of its initial inventory;
+# unlimited products keep one reusable warning line.
+DEFAULT_TEMPLATE_CATALOG: tuple[
+    tuple[str, tuple[tuple[str, int, int | None, bool], ...]], ...
+] = (
+    (
+        "💳paypayガチャ💳",
+        (
+            ("paypay ガチャ 100円", 100, 698, False),
+            ("paypay500円ガチャ", 500, 140, False),
+        ),
+    ),
+    (
+        "💎バウンティラッシュ石垢💎",
+        (
+            ("【Android】バウンティラッシュ石垢 (5200石付近 +3000欠片+超フェス2体)", 1200, 2, False),
+            ("【Android】バウンティラッシュ石垢 (4700~5000石付近+7000~8000欠片)", 2200, 4, False),
+            ("【IOS】5000石+2400欠片", 600, 1, False),
+            ("【IOS】5000石+6500欠片", 1500, 0, False),
+            ("【IOS】5000石+7200~8000欠片", 2200, 2, False),
+            ("【IOS】5000石+6500欠片＋白ニカ", 2800, 1, False),
+            ("【IOS】5000石+6500欠片＋白ニカ＆ウィナーロー", 3200, 3, False),
+        ),
+    ),
+    (
+        "💎プロスピ石垢💎",
+        (
+            ("プロスピ石垢 (3100~3200石+S選手70~85体)", 1600, 2, False),
+            ("プロスピ石垢 (3300~3350石+S選手ランダム)", 2600, 10, False),
+        ),
+    ),
+    (
+        "💎ぷにぷに垢💎",
+        (
+            ("極上垢", 80, 2, False),
+            ("石垢 50~60万「ぷにぷに」", 1000, 5, False),
+            ("石垢 100~110万「ぷにぷに」", 1800, 8, False),
+            ("石垢 150~160万「ぷにぷに」", 2700, 2, False),
+            ("石垢 200~220万「ぷにぷに」", 3500, 2, False),
+        ),
+    ),
+    (
+        "💎レジェンズ石垢💎",
+        (
+            ("【IOS】レジェンズ石垢 (4万5000~5万+アイテム キャラ多数)", 1000, 6, False),
+            ("【IOS】レジェンズ石垢 (4万5000~5万+アイテム キャラ多数)", 1000, 6, False),
+            ("【Android】レジェンズ石垢 (7万5000~8万石+ストーリー未進行)", 2200, 3, False),
+        ),
+    ),
+    (
+        "イーフト石垢",
+        (
+            ("【Android】イーフト石垢 (5000~6000万+300万GP)", 900, 4, False),
+            ("【iOS】イーフト石垢 (7000~8000万+400~500万GP)", 1200, 1, False),
+            ("【iOS】イーフト石垢 (10000~14000万+1000万 GP前後)", 3800, 5, False),
+            ("【Android】イーフト石垢 (10000~12000万+1000万 GP前後)", 4000, 1, False),
+        ),
+    ),
+    (
+        "Gemini系",
+        (
+            ("Gemini Pro 18-month plan", 800, 10, False),
+            ("Gemini Pro forever", 1800, 12, False),
+        ),
+    ),
+    (
+        "サブスクや便利系",
+        (
+            ("Gmail生成無限", 80, None, True),
+            ("YouTube Premium Lifetime Account [永久垢]", 800, 20, False),
+            ("Spotify Premium Lifetime [永久垢]", 400, None, True),
+            ("電話番号認証無料", 400, None, True),
+            ("にゃんこ最強を作れる", 300, None, True),
+        ),
+    ),
+)
 
 
 class OrderError(ValueError):
@@ -310,6 +390,37 @@ def _save(data: dict[str, Any]) -> None:
         _write_data(normalized)
 
 
+def ensure_default_templates() -> int:
+    """Add the supplied starter machines once, without changing existing data."""
+    data = load_data()
+    machines = data["config"]["vending_machines"]
+    added = 0
+    for machine_name, products in DEFAULT_TEMPLATE_CATALOG:
+        if machine_name in machines:
+            continue
+        machines[machine_name] = {"channel_id": None, "message_id": None}
+        for name, price, stock, unlimited in products:
+            contents = [WARNING_CONTENT] if unlimited else [WARNING_CONTENT] * int(stock or 0)
+            data["items"].append(
+                {
+                    "id": data["next_item_id"],
+                    "machine_name": machine_name,
+                    "name": name,
+                    "price": price,
+                    "contents": contents,
+                    "unlimited": unlimited,
+                    "purchase_limit": None,
+                    "sold_count": 0,
+                    "legacy_stock_unregistered": 0,
+                }
+            )
+            data["next_item_id"] += 1
+            added += 1
+    if added:
+        _save(data)
+    return added
+
+
 def get_config(key: str, default: Any = None) -> Any:
     return load_data()["config"].get(key, default)
 
@@ -363,7 +474,7 @@ def delete_vending_machine(name: str) -> bool:
 
 
 def get_machine_names() -> list[str]:
-    names = list(get_vending_machines().keys())
+    names = list(load_data()["config"].get("vending_machines", {}).keys())
     if not names:
         names = [DEFAULT_MACHINE_NAME]
     return names

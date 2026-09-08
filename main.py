@@ -188,6 +188,9 @@ class MyBot(commands.Bot):
         super().__init__(command_prefix="!", intents=intents)
 
     async def setup_hook(self) -> None:
+        added_templates = database.ensure_default_templates()
+        if added_templates:
+            logger.info("Added %s starter template products", added_templates)
         database.recover_delivery_orders()
         self.add_view(AdminPanelView())
         for machine_name in database.get_machine_names():
