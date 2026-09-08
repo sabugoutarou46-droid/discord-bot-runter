@@ -27,7 +27,8 @@ DEFAULT_NOTIFICATION_CHANNEL_ID = 1520682389653819463
 DEFAULT_ACHIEVEMENT_CHANNEL_ID = 1520295467227942932
 MAX_CONTENT_LINES = 1200
 MAX_PURCHASE_LIMIT = 999
-SCHEMA_VERSION = 7
+MAX_SOLD_COUNT = 2_147_483_647
+SCHEMA_VERSION = 8
 JST = ZoneInfo("Asia/Tokyo")
 _lock = threading.RLock()
 _UNSET = object()
@@ -87,6 +88,7 @@ def _public_item(item: dict[str, Any]) -> dict[str, Any]:
     result = copy.deepcopy(item)
     result["contents"] = list(result.get("contents", []))
     result["unlimited"] = bool(result.get("unlimited", False))
+    result["sold_count"] = int(result.get("sold_count", 0) or 0)
     result["stock"] = _stock(result)
     result["stock_label"] = "無限" if result["unlimited"] else f"{result['stock']}個"
     return result
@@ -163,7 +165,7 @@ def _normalise_data(data: dict[str, Any]) -> tuple[dict[str, Any], bool]:
             item["unlimited"] = False
             changed = True
         purchase_limit = item.get("purchase_limit")
-        if data.get("schema_version", 0) < SCHEMA_VERSION and purchase_limit == 1:
+        if data.get("schema_version", 0) < 7 and purchase_limit == 1:
             # Version 6 supplied 1 as an implicit default. Version 7 makes
             # the normal product setting unlimited, so migrate that default.
             item["purchase_limit"] = None
@@ -185,11 +187,30 @@ def _normalise_data(data: dict[str, Any]) -> tuple[dict[str, Any], bool]:
         if "legacy_stock_unregistered" not in item:
             item["legacy_stock_unregistered"] = 0
             changed = True
+        sold_count = item.get("sold_count", 0)
+        try:
+            normalized_sold_count = int(sold_count)
+        except (TypeError, ValueError):
+            normalized_sold_count = 0
+        if (
+            isinstance(sold_count, bool)
+            or normalized_sold_count < 0
+            or normalized_sold_count > MAX_SOLD_COUNT
+        ):
+            normalized_sold_count = 0
+        if "sold_count" not in item or sold_count != normalized_sold_count:
+            item["sold_count"] = normalized_sold_count
+            changed = True
         item.pop("stock", None)
 
     for order in data["orders"]:
         if isinstance(order, dict) and "reserved_contents" not in order:
             order["reserved_contents"] = []
+            changed = True
+        if isinstance(order, dict) and "inventory_committed" not in order:
+            # Orders created before confirmation-time inventory updates already
+            # removed their finite inventory when they were created.
+            order["inventory_committed"] = True
             changed = True
 
     max_item_id = max(
@@ -366,6 +387,7 @@ def add_item(
     contents: list[str] | str,
     unlimited: bool = False,
     purchase_limit: int | None = None,
+    sold_count: int = 0,
 ) -> dict[str, Any]:
     machine_name = str(machine_name).strip()
     name = str(name).strip()
@@ -381,6 +403,12 @@ def add_item(
         or not 1 <= purchase_limit <= MAX_PURCHASE_LIMIT
     ):
         raise ValueError(f"購入上限は1〜{MAX_PURCHASE_LIMIT}個で設定してください。")
+    if (
+        not isinstance(sold_count, int)
+        or isinstance(sold_count, bool)
+        or not 0 <= sold_count <= MAX_SOLD_COUNT
+    ):
+        raise ValueError(f"売れた数は0〜{MAX_SOLD_COUNT}個で入力してください。")
     clean_lines = _clean_contents(contents)
     if unlimited and len(clean_lines) > 1:
         clean_lines = clean_lines[:1]
@@ -398,6 +426,7 @@ def add_item(
         "contents": clean_lines,
         "unlimited": bool(unlimited),
         "purchase_limit": purchase_limit,
+        "sold_count": sold_count,
         "legacy_stock_unregistered": 0,
     }
     data["next_item_id"] += 1
@@ -413,6 +442,7 @@ def update_item(
     contents: list[str] | str | None = None,
     unlimited: bool | None = None,
     purchase_limit: int | None | object = _UNSET,
+    sold_count: int | object = _UNSET,
 ) -> dict[str, Any] | None:
     if name is not None:
         name = str(name).strip()
@@ -426,6 +456,12 @@ def update_item(
         or not 1 <= purchase_limit <= MAX_PURCHASE_LIMIT
     ):
         raise ValueError(f"購入上限は1〜{MAX_PURCHASE_LIMIT}個で設定してください。")
+    if sold_count is not _UNSET and (
+        not isinstance(sold_count, int)
+        or isinstance(sold_count, bool)
+        or not 0 <= sold_count <= MAX_SOLD_COUNT
+    ):
+        raise ValueError(f"売れた数は0〜{MAX_SOLD_COUNT}個で入力してください。")
     clean_lines = _clean_contents(contents) if contents is not None else None
 
     data = load_data()
@@ -446,6 +482,8 @@ def update_item(
         item["unlimited"] = bool(unlimited)
     if purchase_limit is not _UNSET:
         item["purchase_limit"] = purchase_limit
+    if sold_count is not _UNSET:
+        item["sold_count"] = sold_count
     if clean_lines is not None:
         item["contents"] = clean_lines
         item["legacy_stock_unregistered"] = 0
@@ -505,9 +543,21 @@ def create_order(buyer_id: int, item_id: int, quantity: int) -> dict[str, Any]:
             raise OrderError("この商品は現在準備中です。")
         reserved_contents = [contents[0]] * quantity
     else:
-        if len(contents) < quantity:
-            raise OrderError(f"在庫が足りません。現在の在庫: {len(contents)}個")
-        reserved_contents = contents[:quantity]
+        available_contents = list(contents)
+        for existing_order in data["orders"]:
+            if (
+                existing_order.get("item_id") == item_id
+                and existing_order.get("status") in {"pending", "delivering"}
+                and not existing_order.get("inventory_committed", True)
+            ):
+                for reserved_line in existing_order.get("reserved_contents", []):
+                    try:
+                        available_contents.remove(reserved_line)
+                    except ValueError:
+                        pass
+        if len(available_contents) < quantity:
+            raise OrderError(f"在庫が足りません。現在の在庫: {len(available_contents)}個")
+        reserved_contents = available_contents[:quantity]
 
     daily_limit = int(data["config"].get("daily_purchase_limit", 1))
     today = _today_jst()
@@ -523,8 +573,6 @@ def create_order(buyer_id: int, item_id: int, quantity: int) -> dict[str, Any]:
 
     order_id = f"ORD-{data['next_order_id']:08d}"
     data["next_order_id"] += 1
-    if not unlimited:
-        item["contents"] = contents[quantity:]
     order = {
         "id": order_id,
         "buyer_id": buyer_id,
@@ -538,6 +586,7 @@ def create_order(buyer_id: int, item_id: int, quantity: int) -> dict[str, Any]:
         "purchase_date": today,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "reserved_contents": reserved_contents,
+        "inventory_committed": False,
         "status": "pending",
     }
     data["orders"].append(order)
@@ -595,6 +644,21 @@ def complete_order(order_id: str) -> bool:
     order = next((entry for entry in data["orders"] if entry["id"] == order_id), None)
     if order is None or order.get("status") != "delivering":
         return False
+    item = next((entry for entry in data["items"] if entry["id"] == order["item_id"]), None)
+    if item is not None:
+        if not order.get("inventory_committed", True) and not item.get("unlimited"):
+            remaining_contents = list(item.get("contents", []))
+            for reserved_line in order.get("reserved_contents", []):
+                try:
+                    remaining_contents.remove(reserved_line)
+                except ValueError:
+                    pass
+            item["contents"] = remaining_contents
+        item["sold_count"] = min(
+            int(item.get("sold_count", 0) or 0) + int(order.get("quantity", 0) or 0),
+            MAX_SOLD_COUNT,
+        )
+    order["inventory_committed"] = True
     order["status"] = "fulfilled"
     order["fulfilled_at"] = datetime.now(timezone.utc).isoformat()
     _save(data)
@@ -607,7 +671,7 @@ def release_order(order_id: str) -> bool:
     if order is None or order.get("status") not in {"pending", "delivering"}:
         return False
     item = next((entry for entry in data["items"] if entry["id"] == order["item_id"]), None)
-    if item is not None and not item.get("unlimited"):
+    if item is not None and order.get("inventory_committed", True) and not item.get("unlimited"):
         item["contents"] = list(order.get("reserved_contents", [])) + list(item.get("contents", []))
     order["status"] = "cancelled"
     order["cancelled_at"] = datetime.now(timezone.utc).isoformat()
