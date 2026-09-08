@@ -1059,6 +1059,9 @@ class MoveMachineView(SafeView):
     def __init__(self, guild: discord.Guild | None) -> None:
         super().__init__(timeout=180)
         self.guild = guild
+        # Keep the admin menu self-healing when the bot was upgraded while
+        # using an existing data file or when startup seeding was interrupted.
+        database.ensure_default_templates()
         self.add_item(MachineSelect(self.selected, "移動する自販機を選択"))
 
     async def selected(self, interaction: discord.Interaction) -> None:
