@@ -1,3 +1,4 @@
 - [Discord interaction timing](discord-interaction-timing.md) — acknowledge interactions before disk or network work, then use follow-ups.
 - [Confirmation-time inventory](confirmation-time-inventory.md) — distinguish legacy pre-reserved orders from new confirmation-time reservations.
 - [Template seeding recovery](template-seeding-recovery.md) — keep starter-catalog seeding idempotent and retryable from admin entry points.
+- [Discord select options](discord-select-options.md) — disable the select component, not individual SelectOption entries, when no choices exist.

@@ -315,7 +315,7 @@ def channel_options(guild: discord.Guild) -> list[discord.SelectOption]:
         discord.SelectOption(label=truncate(channel.name, 100), value=str(channel.id), description=f"#{channel.name}")
         for channel in channels[:25]
     ]
-    return options or [discord.SelectOption(label="チャンネルなし", value="none", disabled=True)]
+    return options or [discord.SelectOption(label="チャンネルなし", value="none")]
 
 
 class ChannelSelect(ui.Select):
@@ -328,7 +328,13 @@ class ChannelSelect(ui.Select):
         row: int = 0,
     ) -> None:
         self.purpose = purpose
-        super().__init__(placeholder=f"{purpose}を選択", options=channel_options(guild), row=row)
+        options = channel_options(guild)
+        super().__init__(
+            placeholder=f"{purpose}を選択",
+            options=options,
+            row=row,
+            disabled=not any(option.value != "none" for option in options),
+        )
         self.callback = callback_handler  # type: ignore[assignment]
 
 
@@ -336,7 +342,12 @@ class MachineSelect(ui.Select):
     def __init__(self, callback_handler: object, placeholder: str = "自販機を選択") -> None:
         machines = database.get_machine_names()[:25]
         options = [discord.SelectOption(label=truncate(name, 100), value=name) for name in machines]
-        super().__init__(placeholder=placeholder, options=options or [discord.SelectOption(label="自販機なし", value="none", disabled=True)])
+        options = options or [discord.SelectOption(label="自販機なし", value="none")]
+        super().__init__(
+            placeholder=placeholder,
+            options=options,
+            disabled=not any(option.value != "none" for option in options),
+        )
         self.callback = callback_handler  # type: ignore[assignment]
 
 
@@ -354,8 +365,12 @@ class ItemSelect(ui.Select):
             for item in available
         ]
         if not options:
-            options = [discord.SelectOption(label="在庫なし", value="none", disabled=True)]
-        super().__init__(placeholder="商品を選択", options=options)
+            options = [discord.SelectOption(label="在庫なし", value="none")]
+        super().__init__(
+            placeholder="商品を選択",
+            options=options,
+            disabled=not any(option.value != "none" for option in options),
+        )
         if callback_handler is not None:
             self.callback = callback_handler  # type: ignore[assignment]
         self.buyer = buyer
