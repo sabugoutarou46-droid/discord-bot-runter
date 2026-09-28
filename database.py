@@ -635,6 +635,11 @@ def _today_jst() -> str:
 
 
 def create_order(buyer_id: int, item_id: int, quantity: int) -> dict[str, Any]:
+    with _lock:
+        return _create_order_locked(buyer_id, item_id, quantity)
+
+
+def _create_order_locked(buyer_id: int, item_id: int, quantity: int) -> dict[str, Any]:
     if not isinstance(buyer_id, int) or buyer_id <= 0:
         raise OrderError("購入者情報が正しくありません。")
     if not isinstance(quantity, int) or isinstance(quantity, bool) or quantity <= 0:
@@ -652,13 +657,12 @@ def create_order(buyer_id: int, item_id: int, quantity: int) -> dict[str, Any]:
     if unlimited:
         if not contents:
             raise OrderError("この商品は現在準備中です。")
-        reserved_contents = [contents[0]] * quantity
     else:
         available_contents = list(contents)
         for existing_order in data["orders"]:
             if (
                 existing_order.get("item_id") == item_id
-                and existing_order.get("status") in {"pending", "delivering"}
+                and existing_order.get("status") == "delivering"
                 and not existing_order.get("inventory_committed", True)
             ):
                 for reserved_line in existing_order.get("reserved_contents", []):
@@ -668,7 +672,6 @@ def create_order(buyer_id: int, item_id: int, quantity: int) -> dict[str, Any]:
                         pass
         if len(available_contents) < quantity:
             raise OrderError(f"在庫が足りません。現在の在庫: {len(available_contents)}個")
-        reserved_contents = available_contents[:quantity]
 
     daily_limit = int(data["config"].get("daily_purchase_limit", 1))
     today = _today_jst()
@@ -696,7 +699,7 @@ def create_order(buyer_id: int, item_id: int, quantity: int) -> dict[str, Any]:
         "paypay_link": "",
         "purchase_date": today,
         "created_at": datetime.now(timezone.utc).isoformat(),
-        "reserved_contents": reserved_contents,
+        "reserved_contents": [],
         "inventory_committed": False,
         "status": "pending",
     }
@@ -741,16 +744,53 @@ def set_order_paypay_link(order_id: str, paypay_link: str) -> dict[str, Any] | N
 
 
 def begin_delivery(order_id: str) -> dict[str, Any] | None:
+    with _lock:
+        return _begin_delivery_locked(order_id)
+
+
+def _begin_delivery_locked(order_id: str) -> dict[str, Any] | None:
     data = load_data()
     order = next((entry for entry in data["orders"] if entry["id"] == order_id), None)
     if order is None or order.get("status") != "pending":
         return None
+    if not order.get("inventory_committed", True):
+        item = next((entry for entry in data["items"] if entry["id"] == order["item_id"]), None)
+        if item is None:
+            raise OrderError("商品が見つかりません。配布できません。")
+        contents = _clean_contents(item.get("contents", []))
+        quantity = int(order["quantity"])
+        if item.get("unlimited"):
+            if not contents:
+                raise OrderError("この商品は現在準備中です。配布できません。")
+            order["reserved_contents"] = [contents[0]] * quantity
+        else:
+            available_contents = list(contents)
+            for other_order in data["orders"]:
+                if (
+                    other_order["id"] != order_id
+                    and other_order.get("item_id") == order["item_id"]
+                    and other_order.get("status") == "delivering"
+                    and not other_order.get("inventory_committed", True)
+                ):
+                    for reserved_line in other_order.get("reserved_contents", []):
+                        try:
+                            available_contents.remove(reserved_line)
+                        except ValueError:
+                            pass
+            if len(available_contents) < quantity:
+                raise OrderError(f"配布できません。在庫が足りません。現在の在庫: {len(available_contents)}個")
+            order["reserved_contents"] = available_contents[:quantity]
     order["status"] = "delivering"
     _save(data)
     return copy.deepcopy(order)
 
 
 def complete_order(order_id: str) -> bool:
+    with _lock:
+        return _complete_order_locked(order_id)
+
+
+def _complete_order_locked(order_id: str) -> bool:
     data = load_data()
     order = next((entry for entry in data["orders"] if entry["id"] == order_id), None)
     if order is None or order.get("status") != "delivering":
@@ -777,6 +817,11 @@ def complete_order(order_id: str) -> bool:
 
 
 def release_order(order_id: str) -> bool:
+    with _lock:
+        return _release_order_locked(order_id)
+
+
+def _release_order_locked(order_id: str) -> bool:
     data = load_data()
     order = next((entry for entry in data["orders"] if entry["id"] == order_id), None)
     if order is None or order.get("status") not in {"pending", "delivering"}:

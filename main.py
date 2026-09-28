@@ -848,7 +848,17 @@ class PurchaseModal(SafeModal, title="購入手続き"):
             return
 
         if int(self.item["price"]) == 0:
-            order = database.begin_delivery(order["id"]) or order
+            try:
+                delivery_order = database.begin_delivery(order["id"])
+            except database.OrderError as error:
+                database.release_order(order["id"])
+                await private_message(interaction, str(error))
+                return
+            if delivery_order is None:
+                database.release_order(order["id"])
+                await private_message(interaction, "この注文は処理できません。")
+                return
+            order = delivery_order
             try:
                 buyer = await bot.fetch_user(interaction.user.id)
                 await buyer.send(
@@ -919,6 +929,38 @@ class BuyerItemView(SafeView):
         await interaction.response.send_modal(PurchaseModal(item))
 
 
+def resolve_panel_machine(machine_name: str, interaction: discord.Interaction) -> str | None:
+    """Resolve a renamed button only when stored panel identity proves its owner."""
+    if database.get_items(machine_name) or database.get_vending_machine(machine_name):
+        return machine_name
+    message = getattr(interaction, "message", None)
+    channel_id = getattr(interaction, "channel_id", None)
+    message_id = getattr(message, "id", None)
+    if not message_id or not channel_id:
+        return None
+    machines = database.get_vending_machines()
+    exact = [
+        name for name, panel in machines.items()
+        if panel["channel_id"] == channel_id and panel["message_id"] == message_id
+    ]
+    if len(exact) == 1 and database.get_items(exact[0]):
+        return exact[0]
+    if exact:
+        return None
+    # A channel alone is insufficient when several panels share it, or when
+    # the configured message points to a newer panel. Require the actual panel
+    # title as independent evidence for a channel-only mapping.
+    embeds = getattr(message, "embeds", ())
+    title = getattr(embeds[0], "title", None) if embeds else None
+    channel_matches = [
+        name for name, panel in machines.items()
+        if panel["channel_id"] == channel_id and not panel["message_id"] and name == title
+    ]
+    if len(channel_matches) == 1 and database.get_items(channel_matches[0]):
+        return channel_matches[0]
+    return None
+
+
 class VendingButton(ui.DynamicItem[ui.Button], template=r"vending:(?P<action>buy|stock):(?P<machine>.+)"):
     """Dispatch the original public button IDs, including panels from before a restart."""
 
@@ -944,17 +986,18 @@ class VendingButton(ui.DynamicItem[ui.Button], template=r"vending:(?P<action>buy
             await defer_ephemeral(interaction)
             # Do not invent products for a stale or unrecognised panel. Products
             # can survive when a machine is absent from the startup name list.
-            if not database.get_vending_machine(self.machine_name) and not database.get_items(self.machine_name):
+            resolved_name = resolve_panel_machine(self.machine_name, interaction)
+            if resolved_name is None:
                 await private_message(interaction, "この自販機は現在利用できません。")
                 return
             if self.action == "buy":
                 await interaction.followup.send(
                     "購入する商品を選択してください。",
-                    view=BuyerItemView(self.machine_name),
+                    view=BuyerItemView(resolved_name),
                     ephemeral=True,
                 )
             else:
-                await interaction.followup.send(embed=vending_embed(self.machine_name), ephemeral=True)
+                await interaction.followup.send(embed=vending_embed(resolved_name), ephemeral=True)
         except Exception as error:
             # DynamicItem callbacks do not use SafeView.on_error.
             await report_interaction_error(interaction, error, "VendingButton")
@@ -1113,7 +1156,11 @@ class DeliveryConfirmModal(SafeModal, title="商品の配布確認"):
             await private_message(interaction, "「確認」と入力すると配布できます。")
             return
         await defer_ephemeral(interaction)
-        order = database.begin_delivery(self.order_id)
+        try:
+            order = database.begin_delivery(self.order_id)
+        except database.OrderError as error:
+            await private_message(interaction, str(error))
+            return
         if order is None:
             await private_message(interaction, "この注文は処理できません。")
             return
@@ -1127,7 +1174,7 @@ class DeliveryConfirmModal(SafeModal, title="商品の配布確認"):
             )
         except (discord.Forbidden, discord.NotFound, discord.HTTPException):
             database.release_order(self.order_id)
-            await private_message(interaction, "DM送信に失敗したため注文を保留に戻しました。")
+            await private_message(interaction, "DM送信に失敗したため注文を取り消しました。")
             return
         database.complete_order(self.order_id)
         await refresh_all(str(order["machine_name"]))

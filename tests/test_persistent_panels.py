@@ -78,6 +78,63 @@ class PersistentPanelTests(unittest.TestCase):
         )
         self.assertTrue(all(isinstance(item, main.VendingButton) for item in view.children))
 
+    def test_renamed_panel_resolves_by_saved_message_and_channel_without_new_items(self):
+        name = "現在の自販機"
+        item = database.add_item(name, "垢①Steamなし", 100, "real delivery")
+        database.save_vending_machine(name, 10001, 20001)
+        i = interaction()
+        i.message = SimpleNamespace(id=20001, embeds=[SimpleNamespace(title="旧パネル")])
+        i.channel_id = 10001
+        asyncio.run(main.VendingButton("旧パネル", "buy").callback(i))
+        view = i.followup.send.call_args.kwargs["view"]
+        self.assertEqual(view.machine_name, name)
+        self.assertEqual(list(view.items), [item["id"]])
+        self.assertEqual(database.get_item(item["id"])["contents"], ["real delivery"])
+        asyncio.run(main.VendingButton("旧パネル", "stock").callback(i))
+        self.assertEqual(i.followup.send.call_args.kwargs["embed"].title, name)
+
+    def test_channel_fallback_requires_unique_machine_matching_embedded_title(self):
+        name = "現在の自販機"
+        database.add_item(name, "商品", 100, "content")
+        database.save_vending_machine(name, 10001)
+        i = interaction()
+        i.message = SimpleNamespace(id=20001, embeds=[SimpleNamespace(title=name)])
+        i.channel_id = 10001
+        asyncio.run(main.VendingButton("旧パネル", "buy").callback(i))
+        self.assertEqual(i.followup.send.call_args.kwargs["view"].machine_name, name)
+        database.add_item("別の自販機", "商品2", 100, "other content")
+        database.save_vending_machine("別の自販機", 10001)
+        i2 = interaction()
+        i2.message, i2.channel_id = i.message, i.channel_id
+        asyncio.run(main.VendingButton("旧パネル", "buy").callback(i2))
+        # A matching title uniquely identifies the panel even if the channel
+        # hosts another machine with a different title.
+        self.assertEqual(i2.followup.send.call_args.kwargs["view"].machine_name, name)
+        i3 = interaction()
+        i3.message = SimpleNamespace(id=20002, embeds=[SimpleNamespace(title="旧パネル")])
+        i3.channel_id = 10001
+        asyncio.run(main.VendingButton("旧パネル", "buy").callback(i3))
+        self.assertIn("利用できません", i3.response.send_message.call_args.args[0])
+
+    def test_stale_or_ambiguous_mapping_stays_unavailable(self):
+        name = "現在の自販機"
+        database.add_item(name, "商品", 100, "content")
+        database.save_vending_machine(name, 10001, 20001)
+        for channel_id, message_id in ((10002, 20001), (10001, 20002)):
+            i = interaction()
+            i.channel_id = channel_id
+            i.message = SimpleNamespace(id=message_id, embeds=[SimpleNamespace(title=name)])
+            asyncio.run(main.VendingButton("旧パネル", "buy").callback(i))
+            i.followup.send.assert_not_awaited()
+            self.assertIn("利用できません", i.response.send_message.call_args.args[0])
+        # Matching mapping without product data must never manufacture a product.
+        database.save_vending_machine("空の自販機", 10001, 30001)
+        i = interaction()
+        i.channel_id = 10001
+        i.message = SimpleNamespace(id=30001, embeds=[SimpleNamespace(title="空の自販機")])
+        asyncio.run(main.VendingButton("旧パネル", "buy").callback(i))
+        self.assertIn("利用できません", i.response.send_message.call_args.args[0])
+
     def test_admin_product_settings_button_is_authorized_and_opens_menu(self):
         view = main.AdminPanelView()
         button = next(item for item in view.children if item.custom_id == "vending:admin:items")
