@@ -30,6 +30,24 @@ def panel_interaction(title, message_id=20001, channel_id=10001, user_id=0, auth
 
 
 class PersistentPanelTests(unittest.TestCase):
+    def test_legacy_custom_id_with_different_display_title_resolves_automatically(self):
+        name = "保存済み自販機"
+        item = database.add_item(name, "既存商品", 100, "delivery", unlimited=True)
+        i = panel_interaction("無料自販機")
+        asyncio.run(main.VendingButton(name, "buy").callback(i))
+        view = i.followup.send.call_args.kwargs["view"]
+        self.assertEqual(view.machine_name, name)
+        self.assertEqual(view.items[item["id"]]["stock_label"], "無限")
+        self.assertEqual(database.get_vending_panels()[0]["machine_name"], name)
+        i.message.edit.assert_awaited_once()
+
+    def test_conflicting_live_title_and_custom_id_do_not_sell_another_product(self):
+        database.add_item("A", "商品A", 100, "a")
+        database.add_item("B", "商品B", 100, "b")
+        i = panel_interaction("B")
+        self.assertIsNone(main.resolve_panel_machine("A", i))
+        self.assertEqual(database.get_vending_panels(), [])
+
     def test_ready_updates_known_panels_once(self):
         bot = main.MyBot()
         with (

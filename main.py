@@ -939,7 +939,7 @@ class BuyerItemView(SafeView):
 
 
 def resolve_panel_machine(machine_name: str, interaction: discord.Interaction) -> str | None:
-    """Trust identity first, then an exact title; never trust a stale button alone."""
+    """Resolve stored identity or an unambiguous legacy bot button."""
     message = getattr(interaction, "message", None)
     channel_id = getattr(interaction, "channel_id", None)
     message_id = getattr(message, "id", None)
@@ -954,9 +954,17 @@ def resolve_panel_machine(machine_name: str, interaction: discord.Interaction) -
         return name if database.get_vending_machine(name) or database.get_items(name) else None
     embeds = getattr(message, "embeds", ())
     title = getattr(embeds[0], "title", None) if embeds else None
-    # Bot-authored title must exactly match an existing machine. A title that
-    # belongs to another machine beats a stale custom_id; never infer by channel.
-    if title and (database.get_vending_machine(title) or title in database.get_machine_names() or database.get_items(title)):
+    title_exists = bool(title and (
+        database.get_vending_machine(title) or title in database.get_machine_names() or database.get_items(title)
+    ))
+    # Older panels may use a display title different from their machine key.
+    # A verified bot-authored custom ID is usable if its current products exist,
+    # unless the title explicitly identifies a different current machine.
+    if database.get_items(machine_name):
+        if title_exists and title != machine_name:
+            return None
+        return machine_name
+    if title_exists:
         return title
     return None
 
