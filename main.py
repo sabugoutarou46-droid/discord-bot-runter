@@ -174,10 +174,12 @@ class MyBot(commands.Bot):
             logger.info("Added %s starter template products", added_templates)
         database.recover_delivery_orders()
         self.add_view(AdminPanelView())
-        machine_names = database.get_machine_names()
-        logger.info("Registered vending machines: %s", ", ".join(machine_names))
-        for machine_name in machine_names:
-            self.add_view(VendingView(machine_name))
+        # Existing Discord messages may refer to machines absent from the current
+        # config. Match their custom IDs at dispatch time rather than snapshotting
+        # machine names at startup. Do not also register per-machine views: discord.py
+        # dispatches both dynamic and ordinary views for the same interaction.
+        self.add_dynamic_items(VendingButton)
+        logger.info("Persistent vending buttons registered (existing panels supported)")
         for order in database.get_active_orders():
             self.add_view(AdminDeliveryView(order["id"]))
         await self.tree.sync()
@@ -590,8 +592,10 @@ class ContentInputModal(SafeModal, title="配布内容の登録"):
                     contents,
                     self.unlimited,
                     self.purchase_limit,
-                    self.sold_count,
                 )
+                if item is None:
+                    await private_message(interaction, "商品が見つかりません。")
+                    return
                 message = f"商品「{item['name']}」を更新しました。"
         except ValueError as error:
             await private_message(interaction, str(error))
@@ -736,6 +740,7 @@ class EditItemModal(SafeModal, title="商品編集"):
                 self.name.value,
                 int(self.price.value.strip()),
                 purchase_limit,
+                sold_count=int(self.item.get("sold_count", 0)),
                 item_id=int(self.item["id"]),
                 existing_contents=list(self.item.get("contents", [])),
             ),
@@ -914,30 +919,54 @@ class BuyerItemView(SafeView):
         await interaction.response.send_modal(PurchaseModal(item))
 
 
+class VendingButton(ui.DynamicItem[ui.Button], template=r"vending:(?P<action>buy|stock):(?P<machine>.+)"):
+    """Dispatch the original public button IDs, including panels from before a restart."""
+
+    def __init__(self, machine_name: str, action: str) -> None:
+        self.machine_name = machine_name
+        self.action = action
+        super().__init__(
+            ui.Button(
+                label="購入する" if action == "buy" else "在庫確認",
+                style=discord.ButtonStyle.success if action == "buy" else discord.ButtonStyle.secondary,
+                custom_id=f"vending:{action}:{machine_name}",
+            )
+        )
+
+    @classmethod
+    async def from_custom_id(
+        cls, interaction: discord.Interaction, item: ui.Item, match: re.Match[str]
+    ) -> VendingButton:
+        return cls(match["machine"], match["action"])
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        try:
+            await defer_ephemeral(interaction)
+            # Do not invent products for a stale or unrecognised panel. Products
+            # can survive when a machine is absent from the startup name list.
+            if not database.get_vending_machine(self.machine_name) and not database.get_items(self.machine_name):
+                await private_message(interaction, "この自販機は現在利用できません。")
+                return
+            if self.action == "buy":
+                await interaction.followup.send(
+                    "購入する商品を選択してください。",
+                    view=BuyerItemView(self.machine_name),
+                    ephemeral=True,
+                )
+            else:
+                await interaction.followup.send(embed=vending_embed(self.machine_name), ephemeral=True)
+        except Exception as error:
+            # DynamicItem callbacks do not use SafeView.on_error.
+            await report_interaction_error(interaction, error, "VendingButton")
+
+
 class VendingView(SafeView):
     """Only buyer actions are attached to public vending panels."""
 
     def __init__(self, machine_name: str) -> None:
         super().__init__(timeout=None)
-        self.machine_name = machine_name
-        buy = ui.Button(label="購入する", style=discord.ButtonStyle.success, custom_id=f"vending:buy:{machine_name}")
-        buy.callback = self.buy
-        stock = ui.Button(label="在庫確認", style=discord.ButtonStyle.secondary, custom_id=f"vending:stock:{machine_name}")
-        stock.callback = self.check_stock
-        self.add_item(buy)
-        self.add_item(stock)
-
-    async def buy(self, interaction: discord.Interaction) -> None:
-        await defer_ephemeral(interaction)
-        await interaction.followup.send(
-            "購入する商品を選択してください。",
-            view=BuyerItemView(self.machine_name),
-            ephemeral=True,
-        )
-
-    async def check_stock(self, interaction: discord.Interaction) -> None:
-        await defer_ephemeral(interaction)
-        await interaction.followup.send(embed=vending_embed(self.machine_name), ephemeral=True)
+        self.add_item(VendingButton(machine_name, "buy"))
+        self.add_item(VendingButton(machine_name, "stock"))
 
 
 class SettingsView(SafeView):
