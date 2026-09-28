@@ -19,7 +19,31 @@ def interaction(user_id=0):
     )
 
 
+def panel_interaction(title, message_id=20001, channel_id=10001, user_id=0, author_id=42):
+    i = interaction(user_id)
+    i.channel_id = channel_id
+    i.message = SimpleNamespace(
+        id=message_id, embeds=[SimpleNamespace(title=title)],
+        author=SimpleNamespace(id=author_id), edit=AsyncMock(),
+    )
+    return i
+
+
 class PersistentPanelTests(unittest.TestCase):
+    def test_ready_updates_known_panels_once(self):
+        bot = main.MyBot()
+        with (
+            patch.object(database, "get_vending_panels", return_value=[
+                {"machine_name": "A"}, {"machine_name": "A"}, {"machine_name": "B"},
+            ]),
+            patch.object(main, "refresh_machine", new_callable=AsyncMock) as refresh,
+        ):
+            asyncio.run(bot.on_ready())
+            asyncio.run(bot.on_ready())
+            self.assertEqual(refresh.await_count, 2)
+            self.assertEqual({call.args[0] for call in refresh.await_args_list}, {"A", "B"})
+        asyncio.run(bot.close())
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
@@ -31,19 +55,25 @@ class PersistentPanelTests(unittest.TestCase):
         for setting in patches:
             setting.start()
             self.addCleanup(setting.stop)
+        bot_user = patch.object(main, "bot", SimpleNamespace(user=SimpleNamespace(id=42)))
+        bot_user.start()
+        self.addCleanup(bot_user.stop)
 
     def test_restart_dispatches_legacy_ids_without_per_machine_registration(self):
         name = "旧パネル"  # Not a configured machine at startup.
         database.add_item(name, "商品", 0, "delivery", sold_count=7)
         self.assertNotIn(name, database.get_machine_names())
         with (
+            patch.object(main, "bot", main.MyBot()) as bot,
             patch.object(database, "ensure_default_templates", return_value=0),
             patch.object(database, "recover_delivery_orders"),
             patch.object(database, "get_active_orders", return_value=[]),
         ):
-            bot = main.MyBot()
             bot.tree.sync = AsyncMock()
             asyncio.run(bot.setup_hook())
+        bot_user = patch.object(main, "bot", SimpleNamespace(user=SimpleNamespace(id=42)))
+        bot_user.start()
+        self.addCleanup(bot_user.stop)
         store = bot._connection._view_store
         self.assertEqual(list(store._dynamic_items.values()), [main.VendingButton])
         self.assertNotIn((2, f"vending:buy:{name}"), store._views.get(None, {}))
@@ -55,7 +85,7 @@ class PersistentPanelTests(unittest.TestCase):
             match = main.VendingButton.__discord_ui_compiled_template__.fullmatch(custom_id)
             self.assertIsNotNone(match)
             button = asyncio.run(main.VendingButton.from_custom_id(interaction(), None, match))
-            i = interaction()
+            i = panel_interaction(name)
             asyncio.run(button.callback(i))
             i.response.defer.assert_awaited_once_with(ephemeral=True)
             i.followup.send.assert_awaited_once()
@@ -65,7 +95,7 @@ class PersistentPanelTests(unittest.TestCase):
                 self.assertEqual(i.followup.send.call_args.kwargs["embed"].title, name)
         self.assertIsNone(main.VendingButton.__discord_ui_compiled_template__.fullmatch("vending:admin:items"))
         # A deleted/unknown machine cannot silently sell another machine's products.
-        i = interaction()
+        i = panel_interaction("missing", message_id=30000)
         asyncio.run(main.VendingButton("missing", "buy").callback(i))
         self.assertIn("利用できません", i.response.send_message.call_args.args[0])
         asyncio.run(bot.close())
@@ -82,9 +112,7 @@ class PersistentPanelTests(unittest.TestCase):
         name = "現在の自販機"
         item = database.add_item(name, "垢①Steamなし", 100, "real delivery")
         database.save_vending_machine(name, 10001, 20001)
-        i = interaction()
-        i.message = SimpleNamespace(id=20001, embeds=[SimpleNamespace(title="旧パネル")])
-        i.channel_id = 10001
+        i = panel_interaction("旧パネル")
         asyncio.run(main.VendingButton("旧パネル", "buy").callback(i))
         view = i.followup.send.call_args.kwargs["view"]
         self.assertEqual(view.machine_name, name)
@@ -97,22 +125,18 @@ class PersistentPanelTests(unittest.TestCase):
         name = "現在の自販機"
         database.add_item(name, "商品", 100, "content")
         database.save_vending_machine(name, 10001)
-        i = interaction()
-        i.message = SimpleNamespace(id=20001, embeds=[SimpleNamespace(title=name)])
-        i.channel_id = 10001
+        i = panel_interaction(name)
         asyncio.run(main.VendingButton("旧パネル", "buy").callback(i))
         self.assertEqual(i.followup.send.call_args.kwargs["view"].machine_name, name)
         database.add_item("別の自販機", "商品2", 100, "other content")
         database.save_vending_machine("別の自販機", 10001)
-        i2 = interaction()
+        i2 = panel_interaction(name)
         i2.message, i2.channel_id = i.message, i.channel_id
         asyncio.run(main.VendingButton("旧パネル", "buy").callback(i2))
         # A matching title uniquely identifies the panel even if the channel
         # hosts another machine with a different title.
         self.assertEqual(i2.followup.send.call_args.kwargs["view"].machine_name, name)
-        i3 = interaction()
-        i3.message = SimpleNamespace(id=20002, embeds=[SimpleNamespace(title="旧パネル")])
-        i3.channel_id = 10001
+        i3 = panel_interaction("旧パネル", message_id=20002)
         asyncio.run(main.VendingButton("旧パネル", "buy").callback(i3))
         self.assertIn("利用できません", i3.response.send_message.call_args.args[0])
 
@@ -121,19 +145,104 @@ class PersistentPanelTests(unittest.TestCase):
         database.add_item(name, "商品", 100, "content")
         database.save_vending_machine(name, 10001, 20001)
         for channel_id, message_id in ((10002, 20001), (10001, 20002)):
-            i = interaction()
-            i.channel_id = channel_id
-            i.message = SimpleNamespace(id=message_id, embeds=[SimpleNamespace(title=name)])
+            i = panel_interaction("旧パネル", message_id, channel_id)
             asyncio.run(main.VendingButton("旧パネル", "buy").callback(i))
-            i.followup.send.assert_not_awaited()
             self.assertIn("利用できません", i.response.send_message.call_args.args[0])
         # Matching mapping without product data must never manufacture a product.
         database.save_vending_machine("空の自販機", 10001, 30001)
-        i = interaction()
-        i.channel_id = 10001
-        i.message = SimpleNamespace(id=30001, embeds=[SimpleNamespace(title="空の自販機")])
+        i = panel_interaction("空の自販機", 30001)
         asyncio.run(main.VendingButton("旧パネル", "buy").callback(i))
         self.assertIn("利用できません", i.response.send_message.call_args.args[0])
+
+    def test_clicked_existing_panel_updates_in_place_and_tracks_all_messages(self):
+        item = database.add_item("機械", "商品", 100, ["one", "two"])
+        database.save_vending_machine("機械", 10001, 20001)
+        first = panel_interaction("機械")
+        second = panel_interaction("機械", message_id=20002)
+        asyncio.run(main.VendingButton("機械", "buy").callback(first))
+        first.message.edit.assert_awaited_once()
+        self.assertIn("在庫：2個", first.message.edit.call_args.kwargs["embed"].description)
+        asyncio.run(main.VendingButton("機械", "stock").callback(second))
+        self.assertEqual(len(database.get_vending_panels()), 2)
+        self.assertEqual(database.get_vending_machine("機械")["message_id"], 20001)
+        database.update_item(item["id"], contents=["one"])
+        messages = {20001: first.message, 20002: second.message}
+        channel = SimpleNamespace(fetch_message=AsyncMock(side_effect=lambda mid: messages[mid]), send=AsyncMock())
+        with patch.object(main, "fetch_channel", new=AsyncMock(return_value=channel)):
+            asyncio.run(main.refresh_all("機械"))
+        for message in messages.values():
+            self.assertIn("在庫：1個", message.edit.call_args.kwargs["embed"].description)
+        channel.send.assert_not_awaited()
+
+    def test_infinite_and_legacy_stock_reflect_contents_only(self):
+        finite = database.add_item("機械", "有限", 50, ["a", "b"])
+        database.add_item("機械", "無限", 50, ["reuse"], unlimited=True)
+        data = database.load_data()
+        data["items"][0]["stock"] = 14
+        data["items"][0]["legacy_stock_unregistered"] = 12
+        database._save(data)
+        self.assertEqual(database.get_item(finite["id"])["stock"], 2)
+        embed = main.vending_embed("機械")
+        self.assertIn("在庫：2個", embed.description)
+        self.assertIn("在庫：無限", embed.description)
+        database.update_item(finite["id"], contents=[])
+        self.assertIn("在庫：0個", main.vending_embed("機械").description)
+
+    def test_failed_refresh_never_reposts_or_deletes(self):
+        database.add_item("機械", "商品", 1, "real")
+        database.save_vending_machine("機械", 10001, 20001)
+        for failure in (main.discord.NotFound, main.discord.Forbidden):
+            response = SimpleNamespace(status=404 if failure is main.discord.NotFound else 403, reason="error")
+            channel = SimpleNamespace(fetch_message=AsyncMock(side_effect=failure(response, "error")), send=AsyncMock())
+            with patch.object(main, "fetch_channel", new=AsyncMock(return_value=channel)):
+                self.assertIsNone(asyncio.run(main.refresh_machine("機械")))
+                self.assertIsNone(asyncio.run(main.publish_machine("機械", 10001)))
+            channel.send.assert_not_awaited()
+            self.assertEqual(database.get_vending_machine("機械")["message_id"], 20001)
+
+    def test_recovery_requires_owner_and_verified_bot_message(self):
+        database.add_item("機械", "商品", 50, "real")
+        unknown = panel_interaction("名前変更済", user_id=123)
+        asyncio.run(main.VendingButton("古い名前", "buy").callback(unknown))
+        self.assertIn("利用できません", unknown.response.send_message.call_args.args[0])
+        self.assertNotIn("view", unknown.response.send_message.call_args.kwargs)
+        owner = panel_interaction("名前変更済", user_id=main.AUTHORIZED_OWNER_ID)
+        asyncio.run(main.VendingButton("古い名前", "buy").callback(owner))
+        recovery = owner.followup.send.call_args.kwargs["view"]
+        self.assertIsInstance(recovery, main.PanelRecoveryView)
+        owner.message.author.id = 99
+        recovery.children[0]._values = ["機械"]
+        channel = SimpleNamespace(fetch_message=AsyncMock(return_value=owner.message))
+        with patch.object(main, "fetch_channel", new=AsyncMock(return_value=channel)):
+            asyncio.run(recovery.selected(owner))
+        self.assertFalse(database.get_vending_panels())
+        owner.message.edit.assert_not_awaited()
+        # A forged title on someone else's message cannot resolve at all.
+        forged = panel_interaction("機械", author_id=99)
+        self.assertIsNone(main.resolve_panel_machine("機械", forged))
+
+    def test_recovery_links_existing_product_only_and_cannot_rebind_known_panel(self):
+        database.add_item("機械", "商品", 50, "real")
+        database.add_item("別機械", "別商品", 50, "other")
+        owner = panel_interaction("削除された名前", user_id=main.AUTHORIZED_OWNER_ID)
+        asyncio.run(main.VendingButton("古い名前", "buy").callback(owner))
+        recovery = owner.followup.send.call_args.kwargs["view"]
+        recovery.children[0]._values = ["機械"]
+        channel = SimpleNamespace(fetch_message=AsyncMock(return_value=owner.message))
+        with patch.object(main, "fetch_channel", new=AsyncMock(return_value=channel)):
+            asyncio.run(recovery.selected(owner))
+        self.assertEqual(database.get_vending_panels()[0]["machine_name"], "機械")
+        self.assertEqual(owner.message.edit.call_args.kwargs["embed"].title, "機械")
+        recovery.children[0]._values = ["別機械"]
+        with patch.object(main, "fetch_channel", new=AsyncMock(return_value=channel)):
+            asyncio.run(recovery.selected(owner))
+        self.assertEqual(database.get_vending_panels()[0]["machine_name"], "機械")
+        self.assertEqual(owner.message.edit.await_count, 1)
+        denied = panel_interaction("削除された名前", user_id=123)
+        recovery.children[0]._values = ["別機械"]
+        with patch.object(main, "fetch_channel", new=AsyncMock(return_value=channel)):
+            asyncio.run(recovery.selected(denied))
+        self.assertEqual(database.get_vending_panels()[0]["machine_name"], "機械")
 
     def test_admin_product_settings_button_is_authorized_and_opens_menu(self):
         view = main.AdminPanelView()

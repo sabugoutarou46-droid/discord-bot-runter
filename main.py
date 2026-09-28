@@ -167,6 +167,7 @@ class MyBot(commands.Bot):
         intents = discord.Intents.default()
         intents.message_content = True
         super().__init__(command_prefix="!", intents=intents)
+        self._panels_synced = False
 
     async def setup_hook(self) -> None:
         added_templates = database.ensure_default_templates()
@@ -184,6 +185,18 @@ class MyBot(commands.Bot):
             self.add_view(AdminDeliveryView(order["id"]))
         await self.tree.sync()
         logger.info("Slash commands synced and persistent views registered")
+
+    async def on_ready(self) -> None:
+        if self._panels_synced:
+            return
+        self._panels_synced = True
+        names = {panel["machine_name"] for panel in database.get_vending_panels()}
+        for name in names:
+            try:
+                await refresh_machine(name)
+            except Exception:
+                logger.exception("Could not synchronize existing panel for %s", name)
+        logger.info("Existing panel stock synchronization finished")
 
 
 bot = MyBot()
@@ -207,47 +220,42 @@ async def configured_channel(key: str) -> discord.abc.Messageable | None:
 
 
 async def refresh_machine(machine_name: str) -> discord.Message | None:
-    saved = database.get_vending_machine(machine_name)
-    if not saved:
-        return None
-    channel = await fetch_channel(int(saved["channel_id"]))
-    if channel is None or not hasattr(channel, "send"):
-        return None
-    old_message = None
-    if saved.get("message_id"):
+    edited = None
+    for panel in database.get_vending_panels():
+        if panel["machine_name"] != machine_name:
+            continue
+        channel = await fetch_channel(int(panel["channel_id"]))
+        if channel is None:
+            logger.warning("Cannot refresh panel %s: channel unavailable", panel["message_id"])
+            continue
         try:
-            old_message = await channel.fetch_message(int(saved["message_id"]))  # type: ignore[attr-defined]
+            message = await channel.fetch_message(int(panel["message_id"]))  # type: ignore[attr-defined]
+            if not bot.user or getattr(message.author, "id", None) != bot.user.id:
+                logger.warning("Cannot refresh panel %s: message is not bot-owned", panel["message_id"])
+                continue
+            await message.edit(embed=vending_embed(machine_name), view=VendingView(machine_name))
+            edited = message
         except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-            old_message = None
-
-    # Send a fresh panel instead of editing in place. This intentionally moves
-    # an updated vending machine to the bottom of the channel conversation.
-    try:
-        message = await channel.send(embed=vending_embed(machine_name), view=VendingView(machine_name))
-    except (discord.Forbidden, discord.HTTPException):
-        logger.warning("Could not publish vending panel in %s", machine_name)
-        return None
-
-    if old_message:
-        try:
-            await old_message.delete()
-        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-            logger.warning("Could not remove the previous vending panel in %s", machine_name)
-
-    database.save_vending_machine(machine_name, int(saved["channel_id"]), message.id)
-    return message
+            logger.warning("Cannot refresh panel %s: missing message or edit permission", panel["message_id"])
+    return edited
 
 
 async def publish_machine(machine_name: str, channel_id: int) -> discord.Message | None:
     old = database.get_vending_machine(machine_name)
-    if old and old.get("message_id"):
-        old_channel = await fetch_channel(int(old["channel_id"]))
-        if old_channel is not None:
-            try:
-                old_message = await old_channel.fetch_message(int(old["message_id"]))  # type: ignore[attr-defined]
-                await old_message.delete()
-            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-                pass
+    if old and old.get("message_id") and old["channel_id"] == channel_id:
+        # Failed fetch/edit never creates a replacement that strands old buttons.
+        channel = await fetch_channel(channel_id)
+        if channel is None:
+            return None
+        try:
+            message = await channel.fetch_message(int(old["message_id"]))  # type: ignore[attr-defined]
+            if not bot.user or getattr(message.author, "id", None) != bot.user.id:
+                return None
+            await message.edit(embed=vending_embed(machine_name), view=VendingView(machine_name))
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            return None
+        await refresh_machine(machine_name)
+        return message
     channel = await fetch_channel(channel_id)
     if channel is None or not hasattr(channel, "send"):
         return None
@@ -256,6 +264,7 @@ async def publish_machine(machine_name: str, channel_id: int) -> discord.Message
     except (discord.Forbidden, discord.HTTPException):
         return None
     database.save_vending_machine(machine_name, channel_id, message.id)
+    database.register_vending_panel(machine_name, channel_id, message.id)
     return message
 
 
@@ -930,35 +939,73 @@ class BuyerItemView(SafeView):
 
 
 def resolve_panel_machine(machine_name: str, interaction: discord.Interaction) -> str | None:
-    """Resolve a renamed button only when stored panel identity proves its owner."""
-    if database.get_items(machine_name) or database.get_vending_machine(machine_name):
-        return machine_name
+    """Trust identity first, then an exact title; never trust a stale button alone."""
     message = getattr(interaction, "message", None)
     channel_id = getattr(interaction, "channel_id", None)
     message_id = getattr(message, "id", None)
-    if not message_id or not channel_id:
+    if not message_id or not channel_id or not bot.user or getattr(getattr(message, "author", None), "id", None) != bot.user.id:
         return None
-    machines = database.get_vending_machines()
     exact = [
-        name for name, panel in machines.items()
+        panel["machine_name"] for panel in database.get_vending_panels()
         if panel["channel_id"] == channel_id and panel["message_id"] == message_id
     ]
-    if len(exact) == 1 and database.get_items(exact[0]):
-        return exact[0]
     if exact:
-        return None
-    # A channel alone is insufficient when several panels share it, or when
-    # the configured message points to a newer panel. Require the actual panel
-    # title as independent evidence for a channel-only mapping.
+        name = exact[0]
+        return name if database.get_vending_machine(name) or database.get_items(name) else None
     embeds = getattr(message, "embeds", ())
     title = getattr(embeds[0], "title", None) if embeds else None
-    channel_matches = [
-        name for name, panel in machines.items()
-        if panel["channel_id"] == channel_id and not panel["message_id"] and name == title
-    ]
-    if len(channel_matches) == 1 and database.get_items(channel_matches[0]):
-        return channel_matches[0]
+    # Bot-authored title must exactly match an existing machine. A title that
+    # belongs to another machine beats a stale custom_id; never infer by channel.
+    if title and (database.get_vending_machine(title) or title in database.get_machine_names() or database.get_items(title)):
+        return title
     return None
+
+
+class PanelRecoveryView(SafeView):
+    """Explicit owner-only recovery for an unrecognised bot-owned panel."""
+
+    def __init__(self, channel_id: int, message_id: int) -> None:
+        super().__init__(timeout=180)
+        self.channel_id, self.message_id = channel_id, message_id
+        names = list(dict.fromkeys(item["machine_name"] for item in database.get_items()))
+        options = [discord.SelectOption(label=truncate(name, 100), value=name) for name in names[:25]]
+        select = ui.Select(
+            placeholder="リンク先の既存自販機を選択",
+            options=options or [discord.SelectOption(label="商品データがありません", value="none")],
+            disabled=not options,
+        )
+        select.callback = self.selected
+        self.add_item(select)
+
+    async def selected(self, interaction: discord.Interaction) -> None:
+        await defer_ephemeral(interaction)
+        if not is_administrator(interaction):
+            await private_message(interaction, "管理者専用です。")
+            return
+        name = self.children[0].values[0]
+        if not database.get_items(name):
+            await private_message(interaction, "リンク先の商品データがありません。")
+            return
+        channel = await fetch_channel(self.channel_id)
+        if channel is None:
+            await private_message(interaction, "元のパネルのチャンネルが見つかりません。Botの権限を確認してください。")
+            return
+        try:
+            message = await channel.fetch_message(self.message_id)  # type: ignore[attr-defined]
+            if not bot.user or getattr(message.author, "id", None) != bot.user.id:
+                await private_message(interaction, "Bot自身のメッセージではないためリンクできません。")
+                return
+            mapped = next((p["machine_name"] for p in database.get_vending_panels()
+                           if p["channel_id"] == self.channel_id and p["message_id"] == self.message_id), None)
+            if mapped and mapped != name and (database.get_vending_machine(mapped) or database.get_items(mapped)):
+                await private_message(interaction, "別の自販機に登録済みです。変更する前に登録内容を確認してください。")
+                return
+            await message.edit(embed=vending_embed(name), view=VendingView(name))
+            database.register_vending_panel(name, self.channel_id, self.message_id, rebind=True)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            await private_message(interaction, "元のパネルが見つからないか編集できません。Botの権限を確認してください。")
+            return
+        await private_message(interaction, f"既存パネルを「{name}」にリンクして更新しました。")
 
 
 class VendingButton(ui.DynamicItem[ui.Button], template=r"vending:(?P<action>buy|stock):(?P<machine>.+)"):
@@ -988,7 +1035,27 @@ class VendingButton(ui.DynamicItem[ui.Button], template=r"vending:(?P<action>buy
             # can survive when a machine is absent from the startup name list.
             resolved_name = resolve_panel_machine(self.machine_name, interaction)
             if resolved_name is None:
-                await private_message(interaction, "この自販機は現在利用できません。")
+                message = getattr(interaction, "message", None)
+                verified = bool(bot.user and getattr(getattr(message, "author", None), "id", None) == bot.user.id
+                                and getattr(interaction, "channel_id", None) and getattr(message, "id", None))
+                if verified and is_administrator(interaction):
+                    await interaction.followup.send(
+                        "この自販機は現在利用できません。商品データのある既存自販機を選び、元のパネルにリンクしてください。"
+                        " 元の販売内容を確認せず別商品へリンクしないでください。",
+                        view=PanelRecoveryView(interaction.channel_id, message.id), ephemeral=True,
+                    )
+                else:
+                    await private_message(interaction, "この自販機は現在利用できません。管理者に既存パネルと商品データのリンクを確認してもらってください。")
+                return
+            message = interaction.message
+            database.register_vending_panel(resolved_name, interaction.channel_id, message.id)
+            try:
+                await message.edit(embed=vending_embed(resolved_name), view=VendingView(resolved_name))
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                await private_message(interaction, "パネルを更新できません。Botのメッセージ編集権限を管理者に確認してください。")
+                return
+            if self.action == "buy" and not database.get_items(resolved_name):
+                await private_message(interaction, "この自販機は現在利用できません。商品データがありません。管理者に配布内容の登録を依頼してください。")
                 return
             if self.action == "buy":
                 await interaction.followup.send(

@@ -131,6 +131,7 @@ def _default_data() -> dict[str, Any]:
             "achievement_channel_id": DEFAULT_ACHIEVEMENT_CHANNEL_ID,
             "daily_purchase_limit": 0,
             "vending_machines": {},
+            "vending_panels": [],
         },
     }
 
@@ -161,7 +162,8 @@ def _clean_contents(value: Any, *, allow_unlimited_marker: bool = False) -> list
 
 
 def _stock(item: dict[str, Any]) -> int:
-    return -1 if item.get("unlimited") else len(item.get("contents", []))
+    contents = item.get("contents", [])
+    return -1 if item.get("unlimited") and contents else len(contents)
 
 
 def _public_item(item: dict[str, Any]) -> dict[str, Any]:
@@ -170,7 +172,7 @@ def _public_item(item: dict[str, Any]) -> dict[str, Any]:
     result["unlimited"] = bool(result.get("unlimited", False))
     result["sold_count"] = int(result.get("sold_count", 0) or 0)
     result["stock"] = _stock(result)
-    result["stock_label"] = "無限" if result["unlimited"] else f"{result['stock']}個"
+    result["stock_label"] = "無限" if result["stock"] == -1 else f"{result['stock']}個"
     return result
 
 
@@ -199,6 +201,9 @@ def _normalise_data(data: dict[str, Any]) -> tuple[dict[str, Any], bool]:
             changed = True
     if not isinstance(config.get("vending_machines"), dict):
         config["vending_machines"] = {}
+        changed = True
+    if not isinstance(config.get("vending_panels"), list):
+        config["vending_panels"] = []
         changed = True
     if not config.get("notification_channel_id"):
         config["notification_channel_id"] = DEFAULT_NOTIFICATION_CHANNEL_ID
@@ -449,6 +454,52 @@ def get_vending_machine(name: str) -> dict[str, int | None] | None:
     return get_vending_machines().get(name)
 
 
+def get_vending_panels() -> list[dict[str, Any]]:
+    """All known panel identities, including pre-registry primary mappings."""
+    data = load_data()["config"]
+    panels: dict[tuple[int, int], dict[str, Any]] = {}
+    for name, entry in get_vending_machines().items():
+        if entry["message_id"]:
+            key = (int(entry["channel_id"]), int(entry["message_id"]))
+            panels[key] = {"machine_name": name, "channel_id": key[0], "message_id": key[1]}
+    for entry in data.get("vending_panels", []):
+        if not isinstance(entry, dict):
+            continue
+        try:
+            key = (int(entry["channel_id"]), int(entry["message_id"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+        if key[0] > 0 and key[1] > 0 and entry.get("machine_name") and key not in panels:
+            panels[key] = {"machine_name": str(entry["machine_name"]), "channel_id": key[0], "message_id": key[1]}
+    return list(panels.values())
+
+
+def register_vending_panel(name: str, channel_id: int, message_id: int, *, rebind: bool = False) -> None:
+    """Persist a verified message without silently changing its product identity."""
+    if name not in get_machine_names() and not get_items(name):
+        raise ValueError("リンク先の自販機が存在しません。")
+    if channel_id <= 0 or message_id <= 0:
+        raise ValueError("メッセージ情報が正しくありません。")
+    existing = next((entry for entry in get_vending_panels()
+                     if entry["channel_id"] == channel_id and entry["message_id"] == message_id), None)
+    if existing and existing["machine_name"] != name and not rebind:
+        raise ValueError("このパネルは別の自販機に登録されています。")
+    data = load_data()
+    # Primary mappings take precedence over the registry; rebind must remove
+    # the old primary identity, without deleting its products or channel.
+    if existing and existing["machine_name"] != name:
+        old = data["config"]["vending_machines"].get(existing["machine_name"])
+        if old and old.get("channel_id") == channel_id and old.get("message_id") == message_id:
+            old["message_id"] = None
+    panels = data["config"]["vending_panels"]
+    panels[:] = [entry for entry in panels if not (
+        isinstance(entry, dict) and entry.get("channel_id") == channel_id
+        and entry.get("message_id") == message_id
+    )]
+    panels.append({"machine_name": name, "channel_id": channel_id, "message_id": message_id})
+    _save(data)
+
+
 def save_vending_machine(name: str, channel_id: int, message_id: int | None = None) -> None:
     name = str(name).strip()
     if not name or len(name) > 80:
@@ -456,6 +507,11 @@ def save_vending_machine(name: str, channel_id: int, message_id: int | None = No
     if channel_id <= 0:
         raise ValueError("チャンネル情報が正しくありません。")
     data = load_data()
+    previous = data["config"]["vending_machines"].get(name)
+    if previous and previous.get("channel_id") and previous.get("message_id"):
+        panel = {"machine_name": name, "channel_id": previous["channel_id"], "message_id": previous["message_id"]}
+        if panel not in data["config"]["vending_panels"]:
+            data["config"]["vending_panels"].append(panel)
     data["config"]["vending_machines"][name] = {
         "channel_id": channel_id,
         "message_id": message_id,
@@ -468,6 +524,9 @@ def delete_vending_machine(name: str) -> bool:
     if name not in data["config"]["vending_machines"]:
         return False
     del data["config"]["vending_machines"][name]
+    data["config"]["vending_panels"] = [
+        panel for panel in data["config"]["vending_panels"] if panel.get("machine_name") != name
+    ]
     data["items"] = [item for item in data["items"] if item.get("machine_name") != name]
     _save(data)
     return True
